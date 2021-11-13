@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-from pupylib.PupyModule import *
+
+from pupylib.PupyModule import config, PupyModule, PupyArgumentParser
 
 __class_name__="getuid"
 
@@ -7,10 +8,12 @@ __class_name__="getuid"
 class getuid(PupyModule):
     """ get username """
     is_module=False
-    dependencies = [ 'pupyutils.basic_cmds' ]
+    dependencies = ['pupyutils.basic_cmds']
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog="getuid", description=self.__doc__)
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog="getuid", description=cls.__doc__)
 
     def run(self, args):
-        self.success(self.client.conn.modules["pupyutils.basic_cmds"].getuid())
+        getuid = self.client.remote('pupyutils.basic_cmds', 'getuid')
+        self.success(getuid())

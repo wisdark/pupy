@@ -15,83 +15,77 @@
 # --------------------------------------------------------------
 
 import sys
-from contextlib import contextmanager
-from rpyc.utils.helpers import restricted
-import textwrap
 import json
 import zlib
+import msgpack
+from contextlib import contextmanager
+
+from network.lib.rpc.utils.helpers import restricted
+
 
 def safe_obtain(proxy):
     """ safe version of rpyc's rpyc.utils.classic.obtain, without using pickle. """
 
-    if type(proxy) in [list, str, bytes, dict, set, type(None)]:
+    try:
+        conn = object.__getattribute__(proxy, "____conn__")()
+    except AttributeError:
+        ptype = type(proxy)
+
+        if type(proxy) in (tuple, list, set):
+            objs = list(safe_obtain(x) for x in proxy)
+            return ptype(objs)
+
         return proxy
 
-    conn = object.__getattribute__(proxy, "____conn__")()
-    data = conn.root.json_dumps(proxy, compressed=True)
+    if not hasattr(conn, 'obtain'):
+        try:
+            setattr(conn, 'obtain', conn.root.msgpack_dumps)
+            setattr(conn, 'is_msgpack_obtain', True)
+        except:
+            # Fallback, compat only
+            setattr(conn, 'obtain', conn.root.json_dumps)
+            setattr(conn, 'is_msgpack_obtain', False)
+
+    data = conn.obtain(proxy, compressed=True)
     data = zlib.decompress(data)
 
-    try:
-        data = data.decode('utf-8')
-    except:
-        data = data.decode('latin1')
+    if conn.is_msgpack_obtain:
+        data = msgpack.loads(data)
+    else:
+        try:
+            data = data.decode('utf-8')
+        except:
+            data = data.decode('latin1')
 
-    data = json.loads(data) # should prevent any code execution
+        data = json.loads(data) # should prevent any code execution
 
     return data
 
 def obtain(proxy):
     return safe_obtain(proxy)
 
-def hotpatch_oswrite(conn):
-    """ some scripts/libraries use os.write(1, ...) instead of sys.stdout.write to write to stdout """
-    conn.execute(textwrap.dedent("""
-    import sys
-    import os
-    if not hasattr(os, 'real_write'):
-        setattr(os, 'real_write', os.write)
-        def patched_write(fd, s):
-            if fd==1:
-                return sys.stdout.write(s)
-            elif fd==2:
-                return sys.stdout.write(s)
-            else:
-                return os.real_write(fd, s)
-        os.write=patched_write
-    """))
-
 @contextmanager
 def redirected_stdo(module, stdout=None, stderr=None):
-    conn = module.client.conn
+    ns = module.client.conn.namespace
     if stdout is None:
         stdout = module.stdout
     if stderr is None:
         stderr = module.stdout
 
-    hotpatch_oswrite(conn)
-    orig_stdout = conn.modules.sys.stdout
-    orig_stderr = conn.modules.sys.stderr
     try:
-        conn.modules.sys.stdout = restricted(stdout,["softspace", "write", "flush"])
-        conn.modules.sys.stderr = restricted(stderr,["softspace", "write", "flush"])
+        ns['redirect_stdo'](
+            restricted(
+                stdout, ['softspace', 'write', 'flush']),
+            restricted(
+                stderr, ['softspace', 'write', 'flush']))
+
+        module.client.conn.register_remote_cleanup(ns['reset_stdo'])
+
         yield
+
     finally:
-        conn.modules.sys.stdout = orig_stdout
-        conn.modules.sys.stderr = orig_stderr
-
-def interact(module):
-    """remote interactive interpreter
-
-    :param conn: the RPyC connection
-    :param namespace: the namespace to use (a ``dict``)
-    """
-    with redirected_stdio(module):
-        conn.execute("""def _rinteract():
-            def new_exit():
-                print "use ctrl+D to exit the interactive python interpreter."
-            import code
-            code.interact(local = dict({"exit":new_exit, "quit":new_exit}))""")
-        conn.namespace["_rinteract"]()
+        ns['reset_stdo']()
+        module.client.conn.unregister_remote_cleanup(ns['reset_stdo'])
 
 @contextmanager
 def redirected_stdio(module, stdout=None, stderr=None):
@@ -105,10 +99,10 @@ def redirected_stdio(module, stdout=None, stderr=None):
             conn.modules.sys.stdout.write("hello\n")   # will be printed locally
 
     """
-    conn = module.client.conn
-    orig_stdin = conn.modules.sys.stdin
-    orig_stdout = conn.modules.sys.stdout
-    orig_stderr = conn.modules.sys.stderr
+
+    ns = module.client.conn.namespace
+
+    stdin = sys.stdin
 
     if stdout is None:
         stdout = module.stdout
@@ -116,11 +110,18 @@ def redirected_stdio(module, stdout=None, stderr=None):
         stderr = module.stdout
 
     try:
-        conn.modules.sys.stdin = restricted(sys.stdin, ["softspace", "write", "readline", "encoding", "close"])
-        conn.modules.sys.stdout = restricted(stdout, ["softspace", "write", "readline", "encoding", "close", "flush"])
-        conn.modules.sys.stderr = restricted(stderr, ["softspace", "write", "readline", "encoding", "close", "flush"])
+        ns['redirect_stdio'](
+            restricted(
+                stdin, ['softspace', 'write', 'readline', 'encoding', 'close']),
+            restricted(
+                stdout, ['softspace', 'write', 'readline', 'encoding', 'close']),
+            restricted(
+                stderr, ['softspace', 'write', 'readline', 'encoding', 'close']))
+
+        module.client.conn.register_remote_cleanup(ns['reset_stdio'])
+
         yield
+
     finally:
-        conn.modules.sys.stdin = orig_stdin
-        conn.modules.sys.stdout = orig_stdout
-        conn.modules.sys.stderr = orig_stderr
+        ns['reset_stdio']()
+        module.client.conn.unregister_remote_cleanup(ns['reset_stdio'])

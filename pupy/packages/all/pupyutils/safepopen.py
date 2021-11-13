@@ -1,13 +1,20 @@
 # -*- coding: utf-8 -*-
 
+__all__ = ['SafePopen']
+
 import threading
 import subprocess
 import Queue
-import rpyc
 import sys
 import os
+import struct
+import errno
+
+from network.lib.pupyrpc import nowait
 
 ON_POSIX = 'posix' in sys.builtin_module_names
+DETACHED_PROCESS = 0x00000008
+
 
 def read_pipe(queue, pipe, bufsize):
     completed = False
@@ -16,8 +23,8 @@ def read_pipe(queue, pipe, bufsize):
     while not completed:
         try:
             returncode = pipe.poll()
-            completed = returncode != None
-        except Exception as e:
+            completed = returncode is not None
+        except Exception:
             continue
 
         try:
@@ -34,28 +41,68 @@ def read_pipe(queue, pipe, bufsize):
 
     queue.put(returncode)
 
+
+def prepare(suid):
+    import pwd
+
+    if suid is not None:
+        try:
+            if not type(suid) in (int, long):
+                userinfo = pwd.getpwnam(suid)
+                suid = userinfo.pw_uid
+                sgid = userinfo.pw_gid
+            else:
+                userinfo = pwd.getpwuid(suid)
+                sgid = userinfo.pw_gid
+        except Exception:
+            pass
+
+        try:
+            path = os.ttyname(sys.stdin.fileno())
+            os.chown(path, suid, sgid)
+        except Exception:
+            pass
+
+        try:
+            os.initgroups(userinfo.pw_name, sgid)
+            os.chdir(userinfo.pw_dir)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(os, 'setresuid'):
+                os.setresgid(suid, suid, sgid)
+                os.setresuid(suid, suid, sgid)
+            else:
+                euid = os.geteuid()
+                if euid != 0:
+                    os.seteuid(0)
+                    os.setegid(0)
+
+                os.setgid(suid)
+                os.setuid(suid)
+
+        except Exception:
+            pass
+
+    os.setsid()
+
+
 class SafePopen(object):
     def __init__(self, *popen_args, **popen_kwargs):
         self._popen_args = popen_args
-        self._interactive = popen_kwargs.get('interactive', False)
+        self._interactive = popen_kwargs.pop('interactive', False)
+        self._detached = popen_kwargs.pop('detached', False)
+        self._stdin_data = popen_kwargs.pop('stdin_data', None)
+        self._suid = popen_kwargs.pop('suid', None)
 
-        # Well, this is tricky. If I'll pass array, then
-        # it will be RPyC netref, so when I'll try to start
-        # Popen, internally it will be dereferenced. But.
-        # For some reason somewhere some lock acquires. Maybe
-        # on fucked pupysh side? And all stuck.
-        # RPYC IS CRAZY SHIT! DO WE REALLY NEED IT?!!!1111
+        if self._detached:
+            self._interactive = False
 
-        self._popen_args = [
-            str(args) if type(args) == str else [
-                str(x) for x in args
-            ] for args in self._popen_args
-        ]
+        if not ON_POSIX:
+            self._suid = None
 
-        self._popen_kwargs = {
-            k:v for k,v in popen_kwargs.iteritems() \
-            if not k in ( 'interactive' )
-        }
+        self._popen_kwargs = dict(popen_kwargs)
 
         self._reader = None
         self._pipe = None
@@ -68,56 +115,136 @@ class SafePopen(object):
 
         if hasattr(subprocess, 'STARTUPINFO'):
             startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= \
-              subprocess.CREATE_NEW_CONSOLE | \
-              subprocess.STARTF_USESHOWWINDOW
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
             self._popen_kwargs.update({
                 'startupinfo': startupinfo,
+                'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP
             })
 
-        if not 'stderr' in self._popen_kwargs:
+        if not self._detached and 'stderr' not in self._popen_kwargs:
             self._popen_kwargs['stderr'] = subprocess.STDOUT
 
     def _execute(self, read_cb, close_cb):
-        if read_cb:
-            read_cb = rpyc.async(read_cb)
-
-        if close_cb:
-            close_cb = rpyc.async(close_cb)
-
         returncode = None
+        need_fork = False
+
         try:
             kwargs = self._popen_kwargs
             # Setup some required arguments
             kwargs.update({
-                'stdout': subprocess.PIPE,
                 'bufsize': self._bufsize,
                 'close_fds': ON_POSIX
             })
 
-            if self._interactive:
+            if not self._detached:
                 kwargs.update({
-                    'stdin': subprocess.PIPE
+                    'stdin': subprocess.PIPE,
+                    'stdout': subprocess.PIPE,
                 })
 
-            self._pipe = subprocess.Popen(
-                *self._popen_args,
-                **kwargs
-            )
+            elif 'creationflags' in kwargs:
+                kwargs['creationflags'] |= DETACHED_PROCESS
+                for arg in ('stderr', 'stdin', 'stdout'):
+                    if arg in kwargs:
+                        del kwargs[arg]
+            else:
+                need_fork = True
+                devnull = open(os.devnull, 'a')
+                kwargs.update({
+                    'stdout': devnull,
+                    'stderr': devnull,
+                })
+
+            if self._suid:
+                kwargs.update({
+                    'preexec_fn': lambda: prepare(self._suid)
+                })
+
+            if need_fork:
+                p_read, p_write = os.pipe()
+                pid = os.fork()
+                if pid == 0:
+                    os.close(p_read)
+
+                    if 'preexec_fn' not in kwargs:
+                        kwargs['preexec_fn'] = os.setsid
+
+                    try:
+                        self._pipe = subprocess.Popen(
+                            *self._popen_args,
+                            **kwargs
+                        )
+
+                        os.write(p_write, struct.pack('i', self._pipe.poll() or 0))
+
+                    except OSError as e:
+                        os.write(p_write, struct.pack('i', e.errno))
+
+                    except Exception as e:
+                        os.write(p_write, struct.pack('i', 1))
+
+                    finally:
+                        os.close(p_write)
+
+                    os._exit(0)
+
+                else:
+                    os.close(p_write)
+                    returncode, = struct.unpack('i', os.read(p_read, 4))
+                    os.waitpid(pid, 0)
+
+            else:
+                self._pipe = subprocess.Popen(
+                    *self._popen_args,
+                    **kwargs
+                )
+
+            if self._pipe and self._pipe.stdin:
+                if self._stdin_data:
+                    self._pipe.stdin.write(self._stdin_data)
+                    self._pipe.stdin.flush()
+
+                if not self._interactive:
+                    self._pipe.stdin.close()
 
         except OSError as e:
             if read_cb:
-                read_cb("Error: {}".format(e.strerror))
+                read_cb("[ LAUNCH ERROR: {} ]\n".format(e.strerror))
+
             try:
                 returncode = self._pipe.poll()
             except Exception:
                 pass
 
-            self.returncode = returncode if returncode != None else -e.errno
+            self.returncode = returncode if returncode is not None else -e.errno
             if close_cb:
                 close_cb()
                 return
+
+        except Exception as e:
+            if read_cb:
+                read_cb("[ UNKNOWN ERROR: {} ]\n".format(e))
+
+            try:
+                returncode = self._pipe.poll()
+            except Exception:
+                pass
+
+            self.returncode = returncode if returncode is not None else -1
+            if close_cb:
+                close_cb()
+                return
+
+        if self._detached:
+            if self._pipe:
+                self.returncode = self._pipe.poll()
+            else:
+                self.returncode = returncode or None
+
+            if close_cb:
+                close_cb()
+            return
 
         queue = Queue.Queue()
         self._reader = threading.Thread(
@@ -147,9 +274,20 @@ class SafePopen(object):
             close_cb()
 
     def execute(self, close_cb, read_cb=None):
+        if read_cb:
+            read_cb = nowait(read_cb)
+
+        if close_cb:
+            close_cb = nowait(close_cb)
+
         t = threading.Thread(target=self._execute, args=(read_cb, close_cb))
         t.daemon = True
         t.start()
+
+    def get_returncode(self):
+        return errno.errorcode.get(
+            self.returncode, self.returncode
+        )
 
     def terminate(self):
         if not self.returncode and self._pipe:
@@ -164,3 +302,48 @@ class SafePopen(object):
 
         self._pipe.stdin.write(data)
         self._pipe.stdin.flush()
+
+
+def safe_exec(read_cb, close_cb, args, kwargs):
+    kwargs = dict(kwargs)
+
+    sfp = SafePopen(args, **kwargs)
+    sfp.execute(close_cb, read_cb)
+
+    return sfp.terminate, sfp.get_returncode
+
+
+def check_output(cmdline, shell=True, env=None, encoding=None, suid=None):
+    args = {
+        'shell': shell,
+        'stdin': subprocess.PIPE,
+        'stdout': subprocess.PIPE,
+        'stderr': subprocess.STDOUT,
+        'universal_newlines': True,
+        'env': env,
+    }
+
+    if ON_POSIX and suid:
+        args['preexec_fn'] = lambda: prepare(suid)
+
+    p = subprocess.Popen(
+        cmdline,
+        **args
+    )
+
+    complete = [False]
+
+    def get_data():
+        if complete[0]:
+            return ''
+
+        stdout, stderr = p.communicate()
+        complete[0] = True
+
+        if encoding:
+            stdout = stdout.decode(encoding, errors='replace')
+
+        retcode = p.poll()
+        return stdout, retcode
+
+    return p.terminate, get_data

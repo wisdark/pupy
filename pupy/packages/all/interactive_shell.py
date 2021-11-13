@@ -1,25 +1,28 @@
-# -*- coding: UTF8 -*-
+# -*- coding: utf-8 -*-
 
 import sys
-from subprocess import PIPE, Popen
 import subprocess
-from threading  import Thread
-from Queue import Queue, Empty
 import time
 import traceback
 import locale
 import re
-import rpyc
 import os
 
+from subprocess import PIPE, Popen
+from threading import Thread
+from Queue import Queue, Empty
+from network.lib.pupyrpc import nowait
+
+
 ON_POSIX = 'posix' in sys.builtin_module_names
+
 
 def write_output(out, queue):
     try:
         for c in iter(lambda: out.read(1), b""):
             queue.put(c)
         out.close()
-    except Exception as e:
+    except:
         print(traceback.format_exc())
 
 def flush_loop(queue, encoding):
@@ -27,8 +30,8 @@ def flush_loop(queue, encoding):
         stdout_write=sys.stdout.write
         stdout_flush=sys.stdout.flush
         if type(sys.stdout) is not file:
-            stdout_write=rpyc.async(sys.stdout.write)
-            stdout_flush=rpyc.async(sys.stdout.flush)
+            stdout_write=nowait(sys.stdout.write)
+            stdout_flush=nowait(sys.stdout.flush)
         while True:
             buf=b""
             while True:
@@ -45,8 +48,9 @@ def flush_loop(queue, encoding):
                 stdout_write(buf)
                 stdout_flush()
             time.sleep(0.05)
-    except Exception as e:
+    except:
         print(traceback.format_exc())
+        raise
 
 def interactive_open(program=None, encoding=None):
     try:
@@ -103,5 +107,6 @@ def interactive_open(program=None, encoding=None):
             p.stdin.flush()
             if line.strip()=="exit":
                 break
-    except Exception as e:
+    except:
         print(traceback.format_exc())
+        raise

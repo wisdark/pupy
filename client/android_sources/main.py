@@ -7,17 +7,19 @@ import os
 import platform
 import time
 
-os.environ['KIVY_NO_FILELOG']='yes'
+os.environ['KIVY_NO_FILELOG'] = 'yes'
 platform.system = lambda: 'android'
 
 if __name__ == '__main__':
-    import pp
     import sys
     setattr(sys, 'executable', 'PythonService')
+
+    import pp
+
     while True:
         try:
             pp.main()
-        except Exception, e:
+        except Exception as e:
             import traceback
-            traceback.print_exc(e)
+            traceback.print_exc()
             time.sleep(10)

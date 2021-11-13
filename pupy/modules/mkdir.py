@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-from pupylib.PupyModule import *
+
+from pupylib.PupyModule import config, PupyModule, PupyArgumentParser
+from pupylib.PupyCompleter import remote_dirs_completer
 
 __class_name__="mkdir"
 
@@ -8,13 +10,21 @@ class mkdir(PupyModule):
     """ create an empty directory """
 
     is_module=False
-    dependencies = [ 'pupyutils.basic_cmds' ]
+    dependencies = ['pupyutils.basic_cmds']
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog="mkdir", description=self.__doc__)
-        self.arg_parser.add_argument('dir', type=str, help='directory name')
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog="mkdir", description=cls.__doc__)
+        cls.arg_parser.add_argument(
+            'dir', type=str, help='directory name', completer=remote_dirs_completer)
 
     def run(self, args):
-        r = self.client.conn.modules["pupyutils.basic_cmds"].mkdir(args.dir)
-        if r:
-            self.log(r)
+        try:
+            mkdir = self.client.remote('pupyutils.basic_cmds', 'mkdir', 'False')
+            r = mkdir(args.dir)
+            if r:
+                self.log(r)
+
+        except Exception, e:
+            self.error(' '.join(x for x in e.args if type(x) in (str, unicode)))
+            return

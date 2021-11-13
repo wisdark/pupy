@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-from pupylib.PupyModule import *
+
+from pupylib.PupyModule import config, PupyModule, PupyArgumentParser
 
 __class_name__ = "GetHwUuid"
 
@@ -7,16 +8,19 @@ __class_name__ = "GetHwUuid"
 class GetHwUuid(PupyModule):
     """ Try to get UUID (DMI) or machine-id (dbus/linux) """
     dependencies = {
-        'windows': [ 'win32api', 'win32com', 'pythoncom', 'winerror' ],
-        'all': [ 'hwuuid' ]
+        'windows': ['win32api', 'win32com', 'pythoncom', 'winerror'],
+        'all': ['hwuuid']
     }
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(
             prog='get_hwuuid',
-            description=self.__doc__
+            description=cls.__doc__
         )
 
     def run(self, args):
-        method, uuid = self.client.conn.modules['hwuuid'].get_hw_uuid()
-        print '{} ({})'.format(method, uuid)
+        get_hw_uuid = self.client.remote('hwuuid', 'get_hw_uuid')
+
+        method, uuid = get_hw_uuid()
+        self.success('{} ({})'.format(method, uuid))

@@ -1,40 +1,55 @@
 # -*- coding: utf-8 -*-
-from pupylib.PupyModule import *
-from pupylib.PupyCmd import PupyCmd
-from pupylib.utils.rpyc_utils import obtain
-from pupylib.utils.term import colorize
-from modules.lib.utils.shell_exec import shell_exec
-from collections import OrderedDict
-from datetime import datetime, timedelta
+
+from pupylib.PupyModule import config, PupyModule, PupyArgumentParser
+from pupylib.PupyOutput import Color
 
 import logging
-import socket
 
 __class_name__="NetStatModule"
 
-ADMINS = ('NT AUTHORITY\SYSTEM', 'root')
+ADMINS = (r'NT AUTHORITY\SYSTEM', 'root')
+
+def to_unicode(x):
+    if type(x) == str:
+        return x.decode('utf-8')
+    elif type(x) == unicode:
+        return x
+    else:
+        return unicode(x)
 
 @config(cat="admin")
 class NetStatModule(PupyModule):
     """ list terminal sessions """
 
-    dependencies = [ 'pupyps' ]
+    dependencies = ['pupyps']
     is_module=False
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog="netstat", description=self.__doc__)
-        self.arg_parser.add_argument('-l', '--listen', action='store_true', help='Show listening sockets')
-        self.arg_parser.add_argument('-t', '--tcp', action='store_true', help='Show TCP')
-        self.arg_parser.add_argument('-u', '--udp', action='store_true', help='Show UDP')
-        self.arg_parser.add_argument('-s', '--show', nargs='+', default=[], help='Filter by word')
-        self.arg_parser.add_argument('-x', '--hide', nargs='+', default=[], help='Filter out by word')
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog="netstat", description=cls.__doc__)
+        cls.arg_parser.add_argument('-l', '--listen', action='store_true', help='Show listening sockets')
+        cls.arg_parser.add_argument('-t', '--tcp', action='store_true', help='Show TCP')
+        cls.arg_parser.add_argument('-u', '--udp', action='store_true', help='Show UDP')
+        cls.arg_parser.add_argument('-s', '--show', nargs='+', default=[], help='Filter by word')
+        cls.arg_parser.add_argument('-x', '--hide', nargs='+', default=[], help='Filter out by word')
 
     def run(self, args):
         try:
-            rpupyps = self.client.conn.modules.pupyps
-            data = obtain(rpupyps.connections())
-            sock = { int(x):y for x,y in obtain(rpupyps.socktypes).iteritems() }
-            families = { int(x):y for x,y in obtain(rpupyps.families).iteritems() }
+            connections = self.client.remote('pupyps', 'connections')
+
+            families = {
+                int(k):v for k,v in self.client.remote_const(
+                    'pupyps', 'families'
+                ).iteritems()
+            }
+
+            socktypes = {
+                int(k):v for k,v in self.client.remote_const(
+                    'pupyps', 'socktypes'
+                ).iteritems()
+            }
+
+            data = connections()
 
             limit = []
 
@@ -53,16 +68,16 @@ class NetStatModule(PupyModule):
 
                 color = ""
                 family = families[connection['family']]
-                stype = sock[connection['type']]
+                stype = socktypes[connection['type']]
 
-                if limit and not stype in limit:
+                if limit and stype not in limit:
                     continue
 
-                if connection.get('me'):
+                if connection.get('self'):
                     color = 'green'
                 elif connection['status'] in ('CLOSE_WAIT', 'TIME_WAIT', 'TIME_WAIT2'):
                     color = 'darkgrey'
-                elif ( '127.0.0.1' in connection['laddr'] or '::1' in connection['laddr'] ):
+                elif ('127.0.0.1' in connection['laddr'] or '::1' in connection['laddr']):
                     color = 'grey'
 
                 deny = False
@@ -70,31 +85,34 @@ class NetStatModule(PupyModule):
                     deny = True
 
                 connection = {
-                    'AF': colorize(family, color),
-                    'TYPE': colorize(stype, color),
-                    'LADDR': colorize(':'.join([str(x) for x in connection['laddr']]), color),
-                    'RADDR': colorize(':'.join([str(x) for x in connection['raddr']]), color),
-                    'PID': colorize(connection.get('pid', ''), color),
-                    'USER': colorize((connection.get('username') or '').encode('utf8','replace'), color),
-                    'EXE': colorize(
+                    'AF': Color(family, color),
+                    'TYPE': Color(stype, color),
+                    'LADDR': Color(':'.join([str(x) for x in connection['laddr']]), color),
+                    'RADDR': Color(':'.join([str(x) for x in connection['raddr']]), color),
+                    'PID': Color(connection.get('pid', ''), color),
+                    'USER': Color((connection.get('username') or ''), color),
+                    'NAME': Color(
                         connection.get(
-                            'exe', (connection.get('name') or '').encode('utf8','replace')
+                            'name', (connection.get('name') or '')
+                        ), color),
+                    'EXE': Color(
+                        connection.get(
+                            'exe', (connection.get('name') or '')
                         ), color)
                 }
 
                 for v in connection.itervalues():
-                    if any(h in v for h in args.hide):
+                    if any(to_unicode(h) in to_unicode(v.data) for h in args.hide):
                         deny = True
-                    if any(h in v for h in args.show):
+                    if any(to_unicode(h) in to_unicode(v.data) for h in args.show):
                         deny = False
 
                 if not deny:
                     objects.append(connection)
 
-            self.stdout.write(
-                PupyCmd.table_format(objects, wl=[
-                    'AF', 'TYPE', 'LADDR', 'RADDR', 'USER', 'PID', 'EXE'
-                ]))
+            self.table(objects, [
+                'AF', 'TYPE', 'LADDR', 'RADDR', 'USER', 'PID', 'NAME', 'EXE'
+            ], truncate=True)
 
         except Exception, e:
             logging.exception(e)

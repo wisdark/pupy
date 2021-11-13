@@ -14,14 +14,18 @@
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE
 # --------------------------------------------------------------
 
-import time
 import threading
 import inspect
 import ctypes
 import logging
+
 from .PupyErrors import PupyModuleError, PupyModuleExit
 from .PupyConfig import PupyConfig
-import rpyc
+from .PupyOutput import Info, Warn
+from .PupyTriggers import ON_JOB_EXIT, event
+
+from network.lib.rpc import AsyncResultTimeout
+
 
 #original code for interruptable threads from http://tomerfiliba.com/recipes/Thread2/
 def _async_raise(tid, exctype):
@@ -66,52 +70,81 @@ class Thread(threading.Thread):
 
 class ThreadPool(object):
     def __init__(self):
-        self.thread_pool=[]
+        self.thread_pool = []
+        self.interrupt = threading.Event()
 
     def apply_async(self, func, args):
-        t=Thread(target=func, args=args)
-        t.daemon=True
+        t = Thread(target=func, args=args)
+        t.daemon = True
         self.thread_pool.append(t)
         t.start()
 
     def interrupt_all(self):
+        self.interrupt.set()
         for t in self.thread_pool:
             if t.isAlive():
                 t.stop()
 
-    def join(self):
+    def interrupt(self):
+        self.interrupt.set()
+
+    def join(self, timeout=5, on_interrupt=None):
+        allok = True
+
         while True:
             try:
-                allok=True
+                if self.interrupt.is_set():
+                    allok = on_interrupt()
+                    break
+
+                allok = True
                 for t in self.thread_pool:
                     if t.isAlive():
-                        t.join(0.5)
-                        allok=False
+                        t.join(timeout)
+                        allok = False
+
                 if allok:
                     break
+
             except KeyboardInterrupt:
-                print "Press [ENTER] to interrupt the job"
-                pass
+                self.interrupt.set()
+
+        return allok
 
     def all_finished(self):
         for t in self.thread_pool:
             if t.isAlive():
                 return False
+
         return True
 
 class PupyJob(object):
     """ a job handle a group of modules """
 
-    def __init__(self, pupsrv, name):
+    def __init__(self, pupsrv, module, name, args):
         self.name = name
+        self.args = args
         self.pupsrv = pupsrv
+        self.handler = pupsrv.handler
         self.config = pupsrv.config or PupyConfig()
         self.pupymodules = []
         self.worker_pool = ThreadPool()
         self.started = threading.Event()
-        self.error_happened = threading.Event()
+        self.error = None
         self.jid = None
         self.destroyed = False
+        self.id = None
+        self.interrupted = False
+
+    @property
+    def module(self):
+        return type(self.pupymodules[0])
+
+    @property
+    def clients(self):
+        return [
+            x.client for x in self.pupymodules
+        ]
 
     def add_module(self, mod):
         self.pupymodules.append(mod)
@@ -119,82 +152,125 @@ class PupyJob(object):
     def stop(self):
         for p in self.pupymodules:
             p.stop_daemon()
+
         self.pupsrv.del_job(self.jid)
         self.interrupt()
 
-    def module_worker(self, module, cmdline, args, once):
+    def module_worker(self, module, once):
+        e = None
+
         try:
             module.import_dependencies()
-            module.init(cmdline, args)
-            module.run(args)
+            module.init(self.args)
+            module.run(self.args)
+
         except PupyModuleExit as e:
+            self.error = e
             return
+
         except PupyModuleError as e:
-            self.error_happened.set()
-            module.error(str(e))
+            self.error = e
+            if not self.interrupted:
+                module.error(e)
+
         except KeyboardInterrupt:
             pass
+
         except Exception as e:
-            self.error_happened.set()
-            module.error(str(e))
-            import traceback
-            traceback.print_exc(e)
+            import logging
+            logging.exception(e)
+
+            self.error = e
+            if not self.interrupted:
+                module.error(e)
+
         finally:
-            if once:
+            if not self.interrupted and once:
                 module.clean_dependencies()
 
-    def start(self, args, once=False):
+            module.closeio()
+
+            if self.id is not None:
+                kwargs = dict(module.client.desc)
+                kwargs.update({
+                    'jid': self.id,
+                    'exception': e,
+                    'interrupted': self.interrupted
+                })
+
+                event(ON_JOB_EXIT, module.client, self.pupsrv, **kwargs)
+
+                if e:
+                    self.pupsrv.info('<jid={}/cid={}> - error: {}'.format(self.id, module.client.id, e))
+                elif self.interrupted:
+                    self.pupsrv.info('<jid={}/cid={}> interrupted'.format(self.id, module.client.id))
+                else:
+                    self.pupsrv.info('<jid={}/cid={}> done'.format(self.id, module.client.id))
+
+    def start(self, once=False):
         #if self.started.is_set():
         #    raise RuntimeError("job %s has already been started !"%str(self))
 
         for m in self.pupymodules:
-            try:
-                if m.known_args:
-                    margs, unknown_args = m.arg_parser.parse_known_args(args)
-                    margs.unknown_args = unknown_args
-                else:
-                    margs = m.arg_parser.parse_args(args)
-            except PupyModuleExit as e:
-                m.error("Arguments parse error : %s"%e)
-                continue
+
             res = m.is_compatible()
             if type(res) is tuple:
-                comp, comp_exp=res
+                comp, comp_exp = res
             elif res is None:
-                comp=True
-                comp_exp=""
+                comp = True
+                comp_exp = ""
             else:
                 comp=res
-                comp_exp="reason not precised"
+                comp_exp = "reason not precised"
+
             if not comp:
                 m.error("Compatibility error : %s"%comp_exp)
                 continue
-            self.worker_pool.apply_async(self.module_worker, (m, args, margs, once))
+
+            self.worker_pool.apply_async(self.module_worker, (m, once))
+
         self.started.set()
 
     def interrupt(self):
         if not self.started:
             raise RuntimeError("can't interrupt. job %s has not been started"%str(self))
 
+        if self.interrupted:
+            return True
+
+        self.interrupted = True
+        supported = True
+
         #calling the interrupt method is one is defined for the module instead of killing the thread
-        if hasattr(self.pupymodules[0],'interrupt'):
+        if hasattr(self.pupymodules[0], 'interrupt'):
             for m in self.pupymodules:
-                m.interrupt()
+                try:
+                    m.interrupt()
+                except NotImplementedError:
+                    supported = False
         else:
+            supported = False
+
+        if supported:
+            self.handler.display(Info('Interrupt request sended'))
+            return True
+
+        else:
+            self.pupsrv.info(
+                Warn('Module does not support interrupts. Resources may leak!'))
             self.worker_pool.interrupt_all()
-            self.wait()
+            self.check()
+            return False
 
     def interactive_wait(self):
-        while True:
-            if self.is_finished():
-                break
-            time.sleep(0.1)
-        if self.error_happened.is_set():
+        self.worker_pool.join(on_interrupt=self.interrupt)
+
+        if self.error:
             return True
+
         return False
 
-    def wait(self):
-        self.worker_pool.join()
+    def check(self):
         for m in self.pupymodules:
             while True:
                 if not m.client:
@@ -203,13 +279,17 @@ class PupyJob(object):
                 try:
                     m.client.conn._conn.ping(timeout=2)
                     break
+
                 except KeyboardInterrupt:
                     continue
-                except (rpyc.AsyncResultTimeout, ReferenceError, EOFError):
-                    logging.debug("connection %s seems blocked, reinitialising..."%str(m))
+
+                except (AsyncResultTimeout, ReferenceError, EOFError), e:
+                    logging.error('connection {} seems blocked ({}), reinitialising...'.format(
+                        m.client.short_name(), e))
+
                     try:
                         m.client.conn._conn.close()
-                    except (rpyc.AsyncResultTimeout, ReferenceError, EOFError):
+                    except (AsyncResultTimeout, ReferenceError, EOFError):
                         pass
 
                     break
@@ -217,40 +297,20 @@ class PupyJob(object):
     def is_finished(self):
         return self.worker_pool.all_finished()
 
-    def raw_result(self):
-        if len(self.pupymodules)>1:
-            raise AssertionError("raw_result is only available when the job contains a single module")
-        m=self.pupymodules[0]
-        res=m.stdout.getvalue()
-        m.stdout.truncate(0)
-        return res
-
-    def result_summary(self):
-        res=b""
-        for m in self.pupymodules:
-            res+=m.formatter.format_section(str(m.client))
-            gv=m.stdout.getvalue()
-            if type(gv) == unicode:
-                gv = gv.encode('utf8', errors="replace")
-            res += gv+b'\n'
-            m.stdout.truncate(0)
-        return res
-
     def free(self):
         if self.destroyed:
             return
 
         self.destroyed = True
-        for m in self.pupymodules:
-            m.free()
-            del m
+
+        del self.pupymodules[:]
         del self.pupymodules
 
-    def __del__(self):
-        self.free()
-
-    def get_clients_nb(self):
+    def __len__(self):
         return len(self.pupymodules)
 
     def __str__(self):
-        return "< %s >"%(self.name)
+        name = self.name
+        if self.id:
+            name = '{} (id={})'.format(name, self.id)
+        return name

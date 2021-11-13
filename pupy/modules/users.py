@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-from pupylib.PupyModule import *
-from pupylib.utils.rpyc_utils import obtain
-from pupylib.utils.term import terminal_size, colorize
+
+from pupylib.PupyModule import config, PupyModule, PupyArgumentParser
+from pupylib.PupyOutput import Color, Table
 
 __class_name__="Users"
 
-@config(cat="gather", compatibilities=['windows', 'linux', 'darwin'])
+@config(cat="gather", compatibilities=['windows', 'linux', 'darwin', 'posix'])
 class Users(PupyModule):
     """ Get interactive users """
 
@@ -14,19 +14,21 @@ class Users(PupyModule):
         'all': ['pupyutils.users']
     }
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog='users', description=self.__doc__)
-        self.arg_parser.add_argument(
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog='users', description=cls.__doc__)
+        cls.arg_parser.add_argument(
             '-g', '--groups',
             action='store_true', default=False,
             help='show groups membership')
 
     def run(self, args):
-        users = self.client.conn.modules['pupyutils.users'].users()
-        users = obtain(users)
+        users = self.client.remote('pupyutils.users', 'users')
+        users_list = users()
 
-        for user in users['users']:
+        objects = []
 
+        for user in users_list['users']:
             if user['admin']:
                 color = 'lightred'
             elif 'Administrators' in user['groups'] or 'sudo' in user['groups']:
@@ -34,14 +36,16 @@ class Users(PupyModule):
             else:
                 color = 'white'
 
-            output = colorize(unicode(user['name']), color)
+            objects.append({
+                'C': u'➤' if users_list['current'] == user['name'] else '',
+                'NAME': Color(user['name'], color),
+                'GROUPS': Color(','.join(user['groups']), color),
+                'HOME': Color(user['home'], color)
+            })
 
-            if args.groups:
-                output += u': ' + u','.join(user['groups'])
 
-            if users['current'] == user['name']:
-                output = u'➤ ' + output
-            else:
-                output = u'  ' + output
+        headers = ['C', 'NAME', 'HOME']
+        if args.groups:
+            headers.insert(2, 'GROUPS')
 
-            self.log(colorize(output, color))
+        self.log(Table(objects, headers))

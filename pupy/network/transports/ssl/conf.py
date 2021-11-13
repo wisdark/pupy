@@ -3,15 +3,15 @@
 # Pupy is under the BSD 3-Clause license. see the LICENSE file at the root of
 # the project for the detailed licence terms
 
-import os, tempfile, random, string, logging
-from os import path, unlink
-from network.transports import *
-from network.lib import *
-
-import sys
+import os
+import tempfile
 import ssl
 
-from rpyc.utils.authenticators import AuthenticationError
+from network.lib import PupyTCPServer, PupySocketStream
+from network.lib import DummyPupyTransport, PupySSLClient
+from network.lib.rpc.utils.server import AuthenticationError
+from network.transports import Transport
+
 
 class PupySSLAuthenticator(object):
     def __init__(self, role, keystr, certstr, castr, client_cert_required=True):
@@ -42,8 +42,6 @@ class PupySSLAuthenticator(object):
         os.write(fd_ca_path, self.castr)
         os.close(fd_ca_path)
 
-        exception = None
-
         try:
             wrapped_socket = ssl.wrap_socket(
                 sock,
@@ -55,16 +53,11 @@ class PupySSLAuthenticator(object):
                 ssl_version=self.ssl_version,
                 ciphers=self.ciphers
             )
-        except ssl.SSLError:
-            exception = sys.exc_info()[1]
 
         finally:
             os.unlink(tmp_cert_path)
             os.unlink(tmp_key_path)
             os.unlink(tmp_ca_path)
-
-        if exception:
-            raise AuthenticationError(str(exception))
 
         peer = wrapped_socket.getpeercert()
         peer_role = ''
@@ -74,9 +67,9 @@ class PupySSLAuthenticator(object):
                 if item[0][0] == 'organizationalUnitName':
                     peer_role = item[0][1]
 
-            if not ( self.ROLE == 'CLIENT' and peer_role == 'CONTROL' or \
-              self.ROLE == 'CONTROL' and peer_role == 'CLIENT' ):
-              raise AuthenticationError('Invalid peer role: {}'.format(peer_role))
+            if not (self.ROLE == 'CLIENT' and peer_role == 'CONTROL' or \
+              self.ROLE == 'CONTROL' and peer_role == 'CLIENT'):
+                raise AuthenticationError('Invalid peer role: {}'.format(peer_role))
 
         return wrapped_socket, peer
 
@@ -92,7 +85,7 @@ def ssl_authenticator():
         castr = pupy_credentials.SSL_CA_CERT
         role = 'CLIENT'
 
-    except:
+    except ImportError:
         from pupylib.PupyConfig import PupyConfig
         from pupylib.PupyCredentials import Credentials
 

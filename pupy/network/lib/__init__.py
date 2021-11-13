@@ -1,24 +1,88 @@
+# -*- encoding: utf-8 -*-
+
+__all__ = (
+    'Proxy', 'getLogger',
+    'PupySocketStream', 'PupyUDPSocketStream',
+    'chain_transports',
+    'PupyTCPServer', 'PupyUDPServer',
+    'PupyTCPClient', 'PupySSLClient',
+    'PupyProxifiedTCPClient', 'PupyProxifiedSSLClient',
+    'PupyUDPClient',
+    'DummyPupyTransport',
+
+    'RSA_AESClient', 'RSA_AESServer',
+    'PupyHTTPClient', 'PupyHTTPServer',
+    'PupyWebSocketClient', 'PupyWebSocketServer',
+    'EC4TransportServer', 'EC4TransportClient',
+    'ECMTransportServer', 'ECMTransportClient',
+    'ScrambleSuitClient', 'ScrambleSuitServer'
+)
+
+
 import logging
-from .streams import *
+from collections import namedtuple
+
+Proxy = namedtuple('Proxy', [
+       'type', 'addr', 'username', 'password'])
+
+logger = logging.getLogger('pupy.network')
+
+def getLogger(name):
+    return logger.getChild(name)
+
+from .streams.PupySocketStream import PupySocketStream
+
+try:
+    from .streams.PupySocketStream import PupyUDPSocketStream
+except:
+    PupyUDPSocketStream = None
+
 from .base import chain_transports
 from .servers import PupyTCPServer, PupyUDPServer
-from .clients import PupyTCPClient, PupySSLClient, PupyProxifiedTCPClient, PupyProxifiedSSLClient, PupyAsyncClient, PupyUDPClient
+from .clients import PupyTCPClient, PupySSLClient
+from .clients import PupyProxifiedTCPClient, PupyProxifiedSSLClient
+from .clients import PupyUDPClient
+
 from .transports.dummy import DummyPupyTransport
-from .transports.dummy_packets import DummyPupyPacketsTransport
-from .transports.b64 import B64Client, B64Server, B64Transport
-from .transports.http import PupyHTTPClient, PupyHTTPServer
-from .transports.xor import XOR
-from .transports.aes import AES256, AES128
-from .transports.rsa_aes import RSA_AESClient, RSA_AESServer
+
+try:
+    from .transports.rsa_aes import RSA_AESClient, RSA_AESServer
+except Exception, e:
+    logger.exception('Transport rsa_aes disabled: %s', e)
+    RSA_AESClient = None
+    RSA_AESServer = None
+
+try:
+    from .transports.http import PupyHTTPClient, PupyHTTPServer
+except Exception, e:
+    logger.exception('Transport http disabled: %s', e)
+    PupyHTTPClient = None
+    PupyHTTPServer = None
+
+try:
+    from .transports.websocket import PupyWebSocketClient, PupyWebSocketServer
+except Exception, e:
+    logger.exception('Transport websocket disabled: %s', e)
+    PupyWebSocketClient = None
+    PupyWebSocketServer = None
+
 try:
     from .transports.ec4 import EC4TransportServer, EC4TransportClient
 except Exception as e:
-    logging.warning("%s : Transport ec4 disabled"%str(e))
-    EC4TransportServer=None
-    EC4TransportClient=None
+    logger.exception('Transport ec4 disabled: %s', e)
+    EC4TransportServer = None
+    EC4TransportClient = None
+
+try:
+    from .transports.ecm import ECMTransportServer, ECMTransportClient
+except Exception as e:
+    logger.exception('Transport ecm disabled: %s', e)
+    ECMTransportServer = None
+    ECMTransportClient = None
+
 try:
     from .transports.scramblesuit.scramblesuit import ScrambleSuitClient, ScrambleSuitServer
 except Exception as e:
-    logging.warning("%s : Transport scramblesuit disabled"%str(e))
-    ScrambleSuitClient=None
-    ScrambleSuitServer=None
+    logger.exception('Transport scramblesuit disabled: %s', e)
+    ScrambleSuitClient = None
+    ScrambleSuitServer = None

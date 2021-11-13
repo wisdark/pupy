@@ -1,9 +1,10 @@
-import os, string
+import os
+import string
 
 oldWin = '''span {
-	font-family: Verdana;
-	background: #e0e0d0;
-	font-size: 10pt;
+    font-family: Verdana;
+    background: #e0e0d0;
+    font-size: 10pt;
 }
 </style>
 </head>
@@ -11,9 +12,9 @@ oldWin = '''span {
 '''
 
 oldLinux = '''span {
-	font-family: Verdana;
-	background: #e0e0d0;
-	font-size: 13pt;
+    font-family: Verdana;
+    background: #e0e0d0;
+    font-size: 13pt;
 }
 </style>
 </head>
@@ -21,7 +22,7 @@ oldLinux = '''span {
 '''
 
 new = '''span {
-	font-family: Verdana;
+    font-family: Verdana;
 }
 </style>
 </head>

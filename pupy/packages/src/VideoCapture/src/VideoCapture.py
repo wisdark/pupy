@@ -6,7 +6,8 @@ by Markus Gritsch <gritsch@iue.tuwien.ac.at>
 
 import vidcap
 from PIL import Image, ImageFont, ImageDraw
-import time, string
+import time
+import string
 
 default_textpos = 'bl' # t=top, b=bottom;   l=left, c=center, r=right
 textcolor = 0xffffff
@@ -149,7 +150,7 @@ class Device:
                 elif 'b' in textpos:
                     y = height - th - 2
                 else:
-                    raise ValueError, "textpos must contain exactly one out of 't', 'b'"
+                    raise ValueError("textpos must contain exactly one out of 't', 'b'")
                 if 'l' in textpos:
                     x = 2
                 elif 'c' in textpos:
@@ -157,7 +158,7 @@ class Device:
                 elif 'r' in textpos:
                     x = (width - tw) - 2
                 else:
-                    raise ValueError, "textpos must contain exactly one out of 'l', 'c', 'r'"
+                    raise ValueError("textpos must contain exactly one out of 'l', 'c', 'r'")
                 draw = ImageDraw.Draw(im)
                 if timestamp == 2: # shadow
                     draw.text((x+1, y), text, font=self.font, fill=shadowcolor)
@@ -200,7 +201,7 @@ class Device:
         self.getImage(timestamp, boldfont, textpos).save(filename, **keywords)
 
 if __name__ == '__main__':
-    import shutil
+    # import shutil
     #shutil.copy('VideoCapture.py', 'C:\Python20\Lib')
     #shutil.copy('VideoCapture.py', 'C:\Python21\Lib')
     #shutil.copy('VideoCapture.py', 'C:\Python22\Lib')

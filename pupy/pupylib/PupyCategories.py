@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-# -*- coding: UTF8 -*-
+# -*- coding: utf-8 -*-
 # Copyright (c) 2015, Nicolas VERDIER (contact@n1nj4.eu)
 # Pupy is under the BSD 3-Clause license. see the LICENSE file at the root of the project for the detailed licence terms
 
 from . import conf
+
 import logging
 
 class PupyCategories(object):
@@ -21,7 +22,7 @@ class PupyCategories(object):
         for mod in self.pupsrv.iter_modules():
             if not mod.category:
                 mod.category="general"
-            if not mod.category in self.get_categories():
+            if mod.category not in self.get_categories():
                 logging.warning("Undefined category \"%s\" for module %s"%(mod.category, mod.get_name()))
                 self.categories["general"].append(mod)
             else:
@@ -43,12 +44,12 @@ class PupyCategories(object):
 
     def get_module_from_path(self, shell_path):
         """ take a auto-completed path and return the corresponding module """
-        tab=shell_path.strip('/').split('/')
-        if len(tab)==2: #cat/mod
+        tab = shell_path.strip('/').split('/')
+        if len(tab) == 2: #cat/mod
             for mod in self.categories[tab[0]]:
-                if mod.get_name()==tab[1]:
+                if mod.get_name() == tab[1]:
                     return mod
-        elif len(tab)==3: #os/cat/mod
+        elif len(tab) == 3: #os/cat/mod
             for mod in self.categories[tab[1]]:
                 if self.is_os_compatible(mod, tab[0]) and mod.get_name()==tab[2]:
                     return mod
@@ -61,21 +62,26 @@ class PupyCategories(object):
         if system is None:
             return self.categories[category]
         else:
-            l=[]
+            modules = []
             for mod in self.categories[category]:
                 if system in mod.compatible_systems:
-                    l.append(mod)
-            return l
+                    modules.append(mod)
+            return modules
 
     def get_shell_list(self, start_text):
         """ return a list of modules sorted for shell auto completion """
         for k in self.os_shell_lists.iterkeys():
             if start_text.startswith(k):
                 return [x+" " for x in self.os_shell_lists[k] if x.startswith(start_text)]
-        l=[x+" " for x in self.shell_list if x.startswith(start_text)]+[x+"/" for x in self.os_shell_lists.iterkeys() if x.startswith(start_text)]
-        if not l:
-            l+=[x.rsplit("/",1)[1]+" " for x in self.shell_list if x.rsplit("/",1)[1].startswith(start_text)]
-        return l
+        completions = [
+            x+" " for x in self.shell_list if x.startswith(start_text)
+        ] + [
+            x+"/" for x in self.os_shell_lists.iterkeys() if x.startswith(start_text)
+        ]
 
+        if not completions:
+            completions += [
+                x.rsplit("/",1)[1]+" " for x in self.shell_list if x.rsplit("/",1)[1].startswith(start_text)
+            ]
 
-
+        return completions

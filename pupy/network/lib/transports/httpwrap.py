@@ -1,19 +1,35 @@
 # -*- coding: utf-8 -*-
 
+__all__ = ['PupyHTTPWrapperServer']
+
 from ..base import BasePupyTransport, ReleaseChainedTransport
-from .utils import *
-from http_parser.parser import HttpParser
+
+try:
+    from http_parser.parser import HttpParser
+except ImportError:
+    from http_parser.pyparser import HttpParser
+
 from os import path, stat
+from network.lib.buffer import Buffer
+from network.lib import getLogger
+
+logger = getLogger('httpwrap')
 
 class PupyHTTPWrapperServer(BasePupyTransport):
     path = '/index.php?d='
-    allowed_methods = ( 'GET' )
+    allowed_methods = ('GET')
     server = None
     headers = {
-        'Content-Type' : 'text/html; charset=utf-8',
-        'Server' : 'Apache',
+        'Content-Type': 'text/html; charset=utf-8',
+        'Server': 'Apache',
         'Connection': 'close',
     }
+
+    __slots__ = (
+        'parser', 'is_http',
+        'body', 'downstream_buffer',
+        'well_known', 'omit', 'probe_len'
+    )
 
     def __init__(self, *args, **kwargs):
         super(PupyHTTPWrapperServer, self).__init__(*args, **kwargs)
@@ -21,7 +37,13 @@ class PupyHTTPWrapperServer(BasePupyTransport):
         self.parser = HttpParser()
         self.is_http = None
         self.body = []
-        self.downstream_buffer = ''
+        self.downstream_buffer = Buffer()
+
+        self.well_known = ('GET', 'POST', 'OPTIONS', 'HEAD', 'PUT', 'DELETE')
+        self.omit = tuple(
+            '{} {}'.format(x, y) for x in self.well_known for y in (
+                self.path, '/ws/', 'ws/'))
+        self.probe_len = max(len(x) for x in self.omit)
 
     def _http_response(self, code, status, headers=None, datasize=None, content=None):
         headers = {}
@@ -33,7 +55,7 @@ class PupyHTTPWrapperServer(BasePupyTransport):
         if datasize:
             headers.update({
                 'Content-Length': datasize,
-                'Content-Type': 'application/octet-steram',
+                'Content-Type': 'application/octet-stream',
             })
 
         data = '\r\n'.join([
@@ -58,7 +80,7 @@ class PupyHTTPWrapperServer(BasePupyTransport):
                     else:
                         break
 
-        except Exception, e:
+        except:
             self._http_response(404, 'Not found', 'Not found')
 
     def _handle_not_found(self):
@@ -89,8 +111,9 @@ class PupyHTTPWrapperServer(BasePupyTransport):
                         if not (urlpath and urlpath[0] == wwwsecret):
                             self._handle_not_found()
                             if log:
-                                self.server.handler.display_error('{}: GET {} | SECRET = {}'.format(
-                                    '{}:{}'.format(*self.downstream.transport.peer[:2]), urlpath, wwwsecret))
+                                self.server.info('{}: GET {} | SECRET = {}'.format(
+                                    '{}:{}'.format(*self.downstream.transport.peer[:2]), urlpath, wwwsecret),
+                                                 error=True)
                             return
 
                         urlpath = urlpath[1:]
@@ -107,42 +130,78 @@ class PupyHTTPWrapperServer(BasePupyTransport):
                     if path.exists(filepath):
                         self._handle_file(filepath)
                         if log:
-                            self.server.handler.display_success('{}: GET {}'.format(
-                                '{}:{}'.format(*self.downstream.transport.peer[:2]), urlpath))
+                            message = urlpath
+                            if filepath in self.server.served_content:
+                                message = message + ' <' + self.server.served_content[filepath] + '>'
+
+                            self.server.info('{}: GET /{}'.format(
+                                '{}:{}'.format(*self.downstream.transport.peer[:2]), message))
 
                     else:
                         self._handle_not_found()
                         if log:
-                            self.server.handler.display_error('{}: GET {}'.format(
-                                '{}:{}'.format(*self.downstream.transport.peer[:2]), urlpath))
-
-            except Exception, e:
-                print "Exception: {}".format(e)
-
+                            self.server.info('{}: GET {}'.format(
+                                '{}:{}'.format(*self.downstream.transport.peer[:2]), urlpath),
+                                             error=True)
             finally:
                 self.close()
 
     def downstream_recv(self, data):
-        payload = data.read()
+        header = data.peek(self.probe_len)
+
+        if __debug__:
+            logger.debug('Recv: len=%d // header = %s', len(data), header)
 
         if self.server and self.is_http is None:
-            self.is_http = payload.startswith(
-                ('GET', 'POST', 'OPTIONS', 'HEAD', 'PUT', 'DELETE')
-            ) and not payload.startswith(self.path)
+            self.is_http = header.startswith(self.well_known) and \
+              not header.startswith(self.omit)
+
+            if __debug__:
+                logger.debug('Http: %s', self.is_http)
 
         if self.is_http:
-            self._handle_http(payload)
+            self._handle_http(data.read())
         else:
-            self.upstream.write(payload)
+            if __debug__:
+                logger.debug('Write to upstream: len=%d, handler=%s',
+                    len(data), self.upstream.on_write_f)
+
+            data.write_to(self.upstream)
+
             if self.downstream_buffer:
-                self.downstream.write(self.downstream_buffer)
-                self.downstream_buffer = ''
+                if __debug__:
+                    logger.debug('Flush buffer to downstream: len=%d, handler=%s',
+                        len(self.downstream_buffer), self.downstream.on_write_f)
+
+                self.downstream_buffer.write_to(self.downstream)
+
+            if __debug__:
+                logger.debug('Release transport')
+
             raise ReleaseChainedTransport()
 
     def upstream_recv(self, data):
+        if __debug__:
+            logger.debug('Send intent: len=%d', len(data))
+
         if self.is_http is None:
-            self.downstream_buffer = data.read()
+            data.write_to(self.downstream_buffer)
+
+            if __debug__:
+                logger.debug('HTTP? Append to pending buffer: total len=%d',
+                    len(self.downstream_buffer))
+
         elif not self.is_http:
-            self.downstream.write(data.read())
+            if __debug__:
+                logger.debug('Non-HTTP: Direct pass (handler=%s)',
+                    self.downstream.on_write_f)
+
+            if self.downstream_buffer:
+                self.downstream_buffer.write_to(self.downstream)
+
+            data.write_to(self.downstream)
         else:
+            if __debug__:
+                logger.debug('HTTP: Omit data')
+
             pass

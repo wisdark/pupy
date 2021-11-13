@@ -3,35 +3,60 @@
 import os
 import psutil
 import ctypes
-import subprocess
 import pupyps
-import psutil
 import pwd
 import socket
 
 from ctypes.util import find_library
 
-try:
-    x11 = ctypes.cdll.LoadLibrary(find_library('X11'))
-    x11.XOpenDisplay.restype = ctypes.c_void_p
-    x11.XOpenDisplay.argtypes = [ ctypes.c_char_p ]
-    x11.XCloseDisplay.argtypes = [ ctypes.c_void_p ]
-except:
-    x11 = None
-    pass
+xlibs_available = None
+x11 = None
+xau = None
+
+def load_display_libs():
+    global xlibs_available
+    global x11, xau
+
+    if xlibs_available is not None:
+        return
+
+    try:
+        x11 = ctypes.cdll.LoadLibrary(find_library('X11'))
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    except:
+        x11 = None
+        pass
+
+    try:
+        xau = ctypes.cdll.LoadLibrary(find_library('Xau'))
+        xau.XauGetAuthByAddr.restype = ctypes.POINTER(XAuth)
+        xau.XauGetAuthByAddr.argtypes = [
+            ctypes.c_ushort,
+            ctypes.c_ushort, ctypes.c_char_p,
+            ctypes.c_ushort, ctypes.c_char_p,
+            ctypes.c_ushort, ctypes.c_char_p
+       ]
+        xau.XauDisposeAuth.argtypes = [ctypes.POINTER(XAuth)]
+    except:
+        xau = None
+        pass
+
+    xlibs_available = x11 and xau
 
 class XAuth(ctypes.Structure):
     _fields_ = [
-        ( 'family',         ctypes.c_ushort ),
-        ( 'address_length', ctypes.c_ushort ),
-        ( 'address',        ctypes.c_char_p ),
-        ( 'number_length',  ctypes.c_ushort ),
-        ( 'number',         ctypes.c_char_p ),
-        ( 'name_length',    ctypes.c_ushort ),
-        ( 'name',           ctypes.c_char_p ),
-        ( 'data_length',    ctypes.c_ushort ),
-        ( 'data',           ctypes.c_char_p )
-    ]
+        ('family',         ctypes.c_ushort),
+        ('address_length', ctypes.c_ushort),
+        ('address',        ctypes.c_char_p),
+        ('number_length',  ctypes.c_ushort),
+        ('number',         ctypes.c_char_p),
+        ('name_length',    ctypes.c_ushort),
+        ('name',           ctypes.c_char_p),
+        ('data_length',    ctypes.c_ushort),
+        ('data',           ctypes.c_char_p)
+   ]
 
 Families = {
     0: 'tcp',
@@ -39,23 +64,10 @@ Families = {
     256: 'unix',
 }
 
-try:
-    xau = ctypes.cdll.LoadLibrary(find_library('Xau'))
-    xau.XauGetAuthByAddr.restype = ctypes.POINTER(XAuth)
-    xau.XauGetAuthByAddr.argtypes = [
-        ctypes.c_ushort,
-        ctypes.c_ushort, ctypes.c_char_p,
-        ctypes.c_ushort, ctypes.c_char_p,
-        ctypes.c_ushort, ctypes.c_char_p
-    ]
-    xau.XauDisposeAuth.argtypes = [ ctypes.POINTER(XAuth) ]
-except:
-    xau = None
-    pass
-
-
 def check_display(name, authority):
     global x11
+
+    load_display_libs()
 
     if not x11 or not name or not authority:
         return False
@@ -92,6 +104,8 @@ def guess_displays():
     displays = {}
     userinfos = {}
 
+    load_display_libs()
+
     for process in psutil.process_iter():
         try:
             info = process.as_dict(['username', 'environ'])
@@ -99,7 +113,7 @@ def guess_displays():
             continue
 
         if info['username'] and info['environ']:
-            if not 'DISPLAY' in info['environ']:
+            if 'DISPLAY' not in info['environ']:
                 continue
 
             try:
@@ -111,16 +125,16 @@ def guess_displays():
             DISPLAY = info['environ'].get('DISPLAY')
             XAUTHORITY = info['environ'].get('XAUTHORITY')
 
-            if not DISPLAY in displays:
+            if DISPLAY not in displays:
                 displays[DISPLAY] = set()
 
             if not XAUTHORITY:
                 XAUTHORITY = os.path.join(
                     userinfos[info['username']].pw_dir, '.Xauthority'
-                )
+               )
 
             pair = (info['username'], XAUTHORITY)
-            if not pair in displays[DISPLAY] and check_display(DISPLAY, XAUTHORITY):
+            if pair not in displays[DISPLAY] and check_display(DISPLAY, XAUTHORITY):
                 displays[DISPLAY].add(pair)
 
     for user, hosts in pupyps.users().iteritems():
@@ -129,9 +143,9 @@ def guess_displays():
                 try:
                     executable = os.path.basename(
                         os.path.realpath(terminal['exe'])
-                    )
+                   )
 
-                    if not executable in ('X', 'Xorg'):
+                    if executable not in ('X', 'Xorg'):
                         continue
 
                     DISPLAY = None
@@ -144,20 +158,20 @@ def guess_displays():
                         elif arg == '-auth':
                             NextIsXAuthority = True
                         elif NextIsXAuthority:
-                            Xauthority = arg
+                            XAuthority = arg
                             NextIsXAuthority = False
 
                     if not DISPLAY:
                         continue
 
-                    pair = (user, Xauthority)
-                    if not DISPLAY in displays:
+                    pair = (user, XAuthority)
+                    if DISPLAY not in displays:
                         displays[DISPLAY] = set()
 
-                    if not pair in displays[DISPLAY] and check_display(DISPLAY, Xauthority):
+                    if pair not in displays[DISPLAY] and check_display(DISPLAY, XAuthority):
                         displays[DISPLAY].add(pair)
 
-                except Exception, e:
+                except:
                     pass
 
     return {
@@ -165,9 +179,11 @@ def guess_displays():
     }
 
 def attach_to_display(name, xauth=None):
+    load_display_libs()
+
     if not xauth:
         displays = guess_displays()
-        if not name in displays:
+        if name not in displays:
             return False
 
         for user, xauth in displays[name]:
@@ -183,6 +199,9 @@ def attach_to_display(name, xauth=None):
     return False
 
 def extract_xauth_info(name, authtype='MIT-MAGIC-COOKIE-1'):
+
+    load_display_libs()
+
     global xau, Families
     if not xau or not name:
         return None
@@ -219,6 +238,8 @@ def extract_xauth_info(name, authtype='MIT-MAGIC-COOKIE-1'):
 def when_attached(callback, name=':0', poll=10):
     import threading
     import time
+
+    load_display_libs()
 
     def _waiter():
         while not attach_to_display(name):

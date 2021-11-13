@@ -17,28 +17,25 @@ The 64-byte encrypted state contains:
  +-------------------+--------------------+--------------------+-------------+
 """
 
-import os
 import time
 import const
 import struct
 import random
 import datetime
 
-from Crypto.Cipher import AES
-from Crypto.Hash import HMAC
-from Crypto.Hash import SHA256
-#from twisted.internet.address import IPv4Address
+from ..cryptoutils import (
+    NewAESCipher, hmac_sha256_digest, AES_BLOCK_SIZE,
+    get_random
+)
+
+from mycrypto import HMAC_SHA256_128
 
 import logging
 
-import mycrypto
 import util
-import state
-
-log = logging
 
 
-def createTicketMessage( rawTicket, HMACKey ):
+def createTicketMessage(rawTicket, HMACKey):
     """
     Create and return a ready-to-be-sent ticket authentication message.
 
@@ -52,19 +49,18 @@ def createTicketMessage( rawTicket, HMACKey ):
 
     # Subtract the length of the ticket to make the handshake on
     # average as long as a UniformDH handshake message.
-    padding = mycrypto.strongRandom(random.randint(0,
-                                    const.MAX_PADDING_LENGTH -
-                                    const.TICKET_LENGTH))
+    padding = get_random(
+        random.randint(
+            0, const.MAX_PADDING_LENGTH - const.TICKET_LENGTH))
 
-    mark = mycrypto.HMAC_SHA256_128(HMACKey, rawTicket)
-
-    hmac = mycrypto.HMAC_SHA256_128(HMACKey, rawTicket + padding +
-                                    mark + util.getEpoch())
+    mark = HMAC_SHA256_128(HMACKey, rawTicket)
+    hmac = HMAC_SHA256_128(
+        HMACKey, rawTicket + padding + mark + util.getEpoch())
 
     return rawTicket + padding + mark + hmac
 
 
-def issueTicketAndKey( srvState ):
+def issueTicketAndKey(srvState):
     """
     Issue a new session ticket and append it to the according master key.
 
@@ -73,14 +69,14 @@ def issueTicketAndKey( srvState ):
     a protocol message with the flag FLAG_NEW_TICKET set.
     """
 
-    log.info("Issuing new session ticket and master key.")
-    masterKey = mycrypto.strongRandom(const.MASTER_KEY_LENGTH)
+    logging.info("Issuing new session ticket and master key.")
+    masterKey = get_random(const.MASTER_KEY_LENGTH)
     newTicket = (SessionTicket(masterKey, srvState)).issue()
 
     return masterKey + newTicket
 
 
-def checkKeys( srvState ):
+def checkKeys(srvState):
     """
     Check whether the key material for session tickets must be rotated.
 
@@ -94,22 +90,22 @@ def checkKeys( srvState ):
            (srvState.keyCreation is not None)
 
     if (int(time.time()) - srvState.keyCreation) > const.KEY_ROTATION_TIME:
-        log.info("Rotating server key material for session tickets.")
+        logging.info("Rotating server key material for session tickets.")
 
         # Save expired keys to be able to validate old tickets.
         srvState.oldAesKey = srvState.aesKey
         srvState.oldHmacKey = srvState.hmacKey
 
         # Create new key material...
-        srvState.aesKey = mycrypto.strongRandom(const.TICKET_AES_KEY_LENGTH)
-        srvState.hmacKey = mycrypto.strongRandom(const.TICKET_HMAC_KEY_LENGTH)
+        srvState.aesKey = get_random(const.TICKET_AES_KEY_LENGTH)
+        srvState.hmacKey = get_random(const.TICKET_HMAC_KEY_LENGTH)
         srvState.keyCreation = int(time.time())
 
         # ...and save it to disk.
         srvState.writeState()
 
 
-def decrypt( ticket, srvState ):
+def decrypt(ticket, srvState):
     """
     Decrypts, verifies and returns the given `ticket'.
 
@@ -123,12 +119,12 @@ def decrypt( ticket, srvState ):
     assert (ticket is not None) and (len(ticket) == const.TICKET_LENGTH)
     assert (srvState.hmacKey is not None) and (srvState.aesKey is not None)
 
-    log.debug("Attempting to decrypt and verify ticket.")
+    logging.debug("Attempting to decrypt and verify ticket.")
 
     checkKeys(srvState)
 
     # Verify the ticket's authenticity before decrypting.
-    hmac = HMAC.new(srvState.hmacKey, ticket[0:80], digestmod=SHA256).digest()
+    hmac = hmac_sha256_digest(srvState.hmacKey, ticket[0:80])
     if util.isValidHMAC(hmac, ticket[80:const.TICKET_LENGTH],
                         srvState.hmacKey):
         aesKey = srvState.aesKey
@@ -137,8 +133,7 @@ def decrypt( ticket, srvState ):
             return None
 
         # Was the HMAC created using the rotated key material?
-        oldHmac = HMAC.new(srvState.oldHmacKey, ticket[0:80],
-                           digestmod=SHA256).digest()
+        oldHmac = hmac_sha256_digest(srvState.oldHmacKey, ticket[0:80])
         if util.isValidHMAC(oldHmac, ticket[80:const.TICKET_LENGTH],
                             srvState.oldHmacKey):
             aesKey = srvState.oldAesKey
@@ -146,8 +141,9 @@ def decrypt( ticket, srvState ):
             return None
 
     # Decrypt the ticket to extract the state information.
-    aes = AES.new(aesKey, mode=AES.MODE_CBC,
-                  IV=ticket[0:const.TICKET_AES_CBC_IV_LENGTH])
+    aes = NewAESCipher(
+        aesKey, ticket[0:const.TICKET_AES_CBC_IV_LENGTH]
+    )
     plainTicket = aes.decrypt(ticket[const.TICKET_AES_CBC_IV_LENGTH:80])
 
     issueDate = struct.unpack('I', plainTicket[0:4])[0]
@@ -155,14 +151,14 @@ def decrypt( ticket, srvState ):
     masterKey = plainTicket[22:54]
 
     if not (identifier == const.TICKET_IDENTIFIER):
-        log.error("The ticket's HMAC is valid but the identifier is invalid.  "
+        logging.error("The ticket's HMAC is valid but the identifier is invalid.  "
                   "The ticket could be corrupt.")
         return None
 
     return ProtocolState(masterKey, issueDate=issueDate)
 
 
-class ProtocolState( object ):
+class ProtocolState(object):
 
     """
     Defines a ScrambleSuit protocol state contained in a session ticket.
@@ -174,7 +170,7 @@ class ProtocolState( object ):
     form.
     """
 
-    def __init__( self, masterKey, issueDate=int(time.time()) ):
+    def __init__(self, masterKey, issueDate=int(time.time())):
         """
         The constructor of the `ProtocolState' class.
 
@@ -187,7 +183,7 @@ class ProtocolState( object ):
         # Pad to multiple of 16 bytes to match AES' block size.
         self.pad = "\0\0\0\0\0\0\0\0\0\0"
 
-    def isValid( self ):
+    def isValid(self):
         """
         Verifies the expiry date of the object's issue date.
 
@@ -200,17 +196,17 @@ class ProtocolState( object ):
 
         lifetime = int(time.time()) - self.issueDate
         if lifetime > const.SESSION_TICKET_LIFETIME:
-            log.debug("The ticket is invalid and expired %s ago." %
+            logging.debug("The ticket is invalid and expired %s ago." %
                       str(datetime.timedelta(seconds=
                       (lifetime - const.SESSION_TICKET_LIFETIME))))
             return False
 
-        log.debug("The ticket is still valid for %s." %
+        logging.debug("The ticket is still valid for %s." %
                   str(datetime.timedelta(seconds=
                   (const.SESSION_TICKET_LIFETIME - lifetime))))
         return True
 
-    def __repr__( self ):
+    def __repr__(self):
         """
         Return a raw string representation of the object's protocol state.
 
@@ -223,7 +219,7 @@ class ProtocolState( object ):
                            self.masterKey + self.pad
 
 
-class SessionTicket( object ):
+class SessionTicket(object):
 
     """
     Encrypts and authenticates an encapsulated `ProtocolState()' object.
@@ -232,7 +228,7 @@ class SessionTicket( object ):
     The class contains methods to initialise and issue session tickets.
     """
 
-    def __init__( self, masterKey, srvState ):
+    def __init__(self, masterKey, srvState):
         """
         The constructor of the `SessionTicket()' class.
 
@@ -246,7 +242,7 @@ class SessionTicket( object ):
         checkKeys(srvState)
 
         # Initialisation vector for AES-CBC.
-        self.IV = mycrypto.strongRandom(const.TICKET_AES_CBC_IV_LENGTH)
+        self.IV = get_random(const.TICKET_AES_CBC_IV_LENGTH)
 
         # The server's (encrypted) protocol state.
         self.state = ProtocolState(masterKey)
@@ -255,7 +251,7 @@ class SessionTicket( object ):
         self.symmTicketKey = srvState.aesKey
         self.hmacTicketKey = srvState.hmacKey
 
-    def issue( self ):
+    def issue(self):
         """
         Returns a ready-to-use session ticket after prior initialisation.
 
@@ -267,17 +263,16 @@ class SessionTicket( object ):
         self.state.issueDate = int(time.time())
 
         # Encrypt the protocol state.
-        aes = AES.new(self.symmTicketKey, mode=AES.MODE_CBC, IV=self.IV)
+        aes = NewAESCipher(self.symmTicketKey, self.IV)
         state = repr(self.state)
-        assert (len(state) % AES.block_size) == 0
+        assert (len(state) % AES_BLOCK_SIZE) == 0
         cryptedState = aes.encrypt(state)
 
         # Authenticate the encrypted state and the IV.
-        hmac = HMAC.new(self.hmacTicketKey,
-                        self.IV + cryptedState, digestmod=SHA256).digest()
+        hmac = hmac_sha256_digest(self.hmacTicketKey, self.IV + cryptedState)
 
         finalTicket = self.IV + cryptedState + hmac
-        log.debug("Returning %d-byte ticket." % len(finalTicket))
+        logging.debug("Returning %d-byte ticket." % len(finalTicket))
 
         return finalTicket
 

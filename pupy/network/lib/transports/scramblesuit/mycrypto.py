@@ -5,22 +5,22 @@ The implemented algorithms include HKDF-SHA256, HMAC-SHA256-128, (CS)PRNGs and
 an interface for encryption and decryption using AES in counter mode.
 """
 
-import Crypto.Hash.SHA256
-import Crypto.Hash.HMAC
-import Crypto.Util.Counter
-import Crypto.Cipher.AES
-
 from ... import base
+from ..cryptoutils import (
+    hmac_sha256_digest, AES_MODE_CTR, NewAESCipher
+)
 
-import math
-import os
+from struct import unpack
 
 import const
 import logging
+
+from math import ceil
+
 log = logging
 
 
-class HKDF_SHA256( object ):
+class HKDF_SHA256(object):
 
     """
     Implements HKDF using SHA256: https://tools.ietf.org/html/rfc5869
@@ -29,7 +29,12 @@ class HKDF_SHA256( object ):
     the provided PRK already exhibits strong entropy.
     """
 
-    def __init__( self, prk, info="", length=32 ):
+    __slots__ = (
+        'hashLen', 'N', 'prk', 'info',
+        'length', 'ctr', 'T'
+    )
+
+    def __init__(self, prk, info="", length=32):
         """
         Initialise a HKDF_SHA256 object.
         """
@@ -44,14 +49,14 @@ class HKDF_SHA256( object ):
             raise ValueError("The PRK must be at least %d bytes in length "
                              "(%d given)." % (self.hashLen, len(prk)))
 
-        self.N = math.ceil(float(length) / self.hashLen)
+        self.N = ceil(float(length) / self.hashLen)
         self.prk = prk
         self.info = info
         self.length = length
         self.ctr = 1
         self.T = ""
 
-    def expand( self ):
+    def expand(self):
         """
         Return the expanded output key material.
 
@@ -59,45 +64,35 @@ class HKDF_SHA256( object ):
         L.
         """
 
-        tmp = ""
-
         # Prevent the accidental re-use of output keying material.
         if len(self.T) > 0:
             raise base.PluggableTransportError("HKDF-SHA256 OKM must not "
                                                "be re-used by application.")
 
+        tmp = ''
+
         while self.length > len(self.T):
-            tmp = Crypto.Hash.HMAC.new(self.prk, tmp + self.info +
-                                       chr(self.ctr),
-                                       Crypto.Hash.SHA256).digest()
+            tmp = hmac_sha256_digest(self.prk, tmp + self.info + chr(self.ctr))
             self.T += tmp
             self.ctr += 1
 
         return self.T[:self.length]
 
 
-def HMAC_SHA256_128( key, msg ):
+def HMAC_SHA256_128(key, msg):
     """
     Return the HMAC-SHA256-128 of the given `msg' authenticated by `key'.
     """
 
     assert(len(key) >= const.SHARED_SECRET_LENGTH)
 
-    h = Crypto.Hash.HMAC.new(key, msg, Crypto.Hash.SHA256)
+    h = hmac_sha256_digest(key, msg)
 
     # Return HMAC truncated to 128 out of 256 bits.
-    return h.digest()[:16]
+    return h[:16]
 
 
-def strongRandom( size ):
-    """
-    Return `size' bytes of strong randomness suitable for cryptographic use.
-    """
-
-    return os.urandom(size)
-
-
-class PayloadCrypter:
+class PayloadCrypter(object):
 
     """
     Provides methods to encrypt data using AES in counter mode.
@@ -106,7 +101,9 @@ class PayloadCrypter:
     initialisation vector and to encrypt and decrypt data.
     """
 
-    def __init__( self ):
+    __slots__ = ('sessionKey', 'crypter')
+
+    def __init__(self):
         """
         Initialise a PayloadCrypter object.
         """
@@ -115,9 +112,8 @@ class PayloadCrypter:
 
         self.sessionKey = None
         self.crypter = None
-        self.counter = None
 
-    def setSessionKey( self, key, iv ):
+    def setSessionKey(self, key, iv):
         """
         Set AES' session key and the initialisation vector for counter mode.
 
@@ -134,16 +130,12 @@ class PayloadCrypter:
         # 2^64 * 16 bytes of data while avoiding counter reuse.  That amount is
         # effectively out of reach given today's networking performance.
         log.debug("Setting IV for AES-CTR.")
-        self.counter = Crypto.Util.Counter.new(64,
-                                               prefix = iv,
-                                               initial_value = 1,
-                                               allow_wraparound = False)
 
-        log.debug("Setting session key for AES-CTR.")
-        self.crypter = Crypto.Cipher.AES.new(key, Crypto.Cipher.AES.MODE_CTR,
-                                             counter=self.counter)
+        iv = (unpack('>Q', iv)[0] << 64) + 1
 
-    def encrypt( self, data ):
+        self.crypter = NewAESCipher(key, iv, AES_MODE_CTR)
+
+    def encrypt(self, data):
         """
         Encrypts the given `data' using AES in counter mode.
         """

@@ -6,9 +6,6 @@ transport protocol is available here:
 http://www.cs.kau.se/philwint/scramblesuit/
 """
 
-#from twisted.internet import reactor
-from ..obfscommon import threads as reactor
-
 from ... import base
 import logging
 
@@ -26,6 +23,7 @@ import uniformdh
 import state
 import fifobuf
 import ticket
+import time
 
 log = logging
 
@@ -34,8 +32,7 @@ class ReadPassFile(argparse.Action):
         with open(values) as f:
             setattr(namespace, self.dest, f.readline().strip())
 
-
-class ScrambleSuitTransport( base.BaseTransport ):
+class ScrambleSuitTransport(base.BaseTransport):
 
     """
     Implement the ScrambleSuit protocol.
@@ -45,7 +42,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
     modules.
     """
 
-    def __init__( self, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         """
         Initialise a ScrambleSuitTransport object.
         """
@@ -53,6 +50,8 @@ class ScrambleSuitTransport( base.BaseTransport ):
         #log.debug("Initialising %s." % const.TRANSPORT_NAME)
 
         super(ScrambleSuitTransport, self).__init__(*args, **kwargs)
+
+        self.drainedHandshake = 0
 
         # Load the server's persistent state from file.
         if self.weAreServer:
@@ -102,7 +101,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
         self.uniformdh = uniformdh.new(self.uniformDHSecret, self.weAreServer)
 
     @classmethod
-    def setup( cls, transportConfig ):
+    def setup(cls, transportConfig):
         """
         Called once when obfsproxy starts.
         """
@@ -150,7 +149,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
             state.writeServerPassword(cls.uniformDHSecret)
 
     @classmethod
-    def get_public_server_options( cls, transportOptions ):
+    def get_public_server_options(cls, transportOptions):
         """
         Return ScrambleSuit's BridgeDB parameters, i.e., the shared secret.
 
@@ -160,7 +159,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
 
         #log.debug("Tor's transport options: %s" % str(transportOptions))
 
-        if not "password" in transportOptions:
+        if "password" not in transportOptions:
             #log.warning("No password found in transport options (use Tor's " \
             #            "`ServerTransportOptions' to set your own password)." \
             #            "  Using automatically generated password instead.")
@@ -171,7 +170,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
 
         return transportOptions
 
-    def deriveSecrets( self, masterKey ):
+    def deriveSecrets(self, masterKey):
         """
         Derive various session keys from the given `masterKey'.
 
@@ -204,7 +203,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
             self.sendCrypter, self.recvCrypter = self.recvCrypter, \
                                                  self.sendCrypter
 
-    def circuitConnected( self ):
+    def circuitConnected(self):
         """
         Initiate a ScrambleSuit handshake.
 
@@ -218,17 +217,16 @@ class ScrambleSuitTransport( base.BaseTransport ):
             return
 
         # The preferred authentication mechanism is a session ticket.
-        bridge = self.circuit.downstream.transport.getPeer()
         if self.uniformDHSecret is None:
-                #log.warning("A UniformDH password is not set, most likely " \
-                #            "a missing 'password' argument.")
-            self.circuit.close()
-            return
+            # log.warning("A UniformDH password is not set, most likely " \
+            #            "a missing 'password' argument.")
+
+            raise EOFError('A UniformDH password is not set')
             #log.debug("No session ticket to redeem.  Running UniformDH.")
 
-        self.circuit.downstream.write(self.uniformdh.createHandshake())
+        self.downstream.write(self.uniformdh.createHandshake())
 
-    def sendRemote( self, data, flags=const.FLAG_PAYLOAD ):
+    def sendRemote(self, data, flags=const.FLAG_PAYLOAD):
         """
         Send data to the remote end after a connection was established.
 
@@ -250,8 +248,8 @@ class ScrambleSuitTransport( base.BaseTransport ):
 
             if len(self.choppingBuf) == 0:
                 self.choppingBuf.write(blurb)
-                reactor.callLater(self.iatMorpher.randomSample(),
-                                  self.flushPieces)
+                time.sleep(self.iatMorpher.randomSample())
+                self.flushPieces()
             else:
                 # flushPieces() is still busy processing the chopping buffer.
                 self.choppingBuf.write(blurb)
@@ -260,9 +258,9 @@ class ScrambleSuitTransport( base.BaseTransport ):
             padBlurb = self.pktMorpher.getPadding(self.sendCrypter,
                                                   self.sendHMAC,
                                                   len(blurb))
-            self.circuit.downstream.write(blurb + padBlurb)
+            self.downstream.write(blurb + padBlurb)
 
-    def flushPieces( self ):
+    def flushPieces(self):
         """
         Write the application data in chunks to the wire.
 
@@ -276,7 +274,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
         # Drain and send an MTU-sized chunk from the chopping buffer.
         if len(self.choppingBuf) > const.MTU:
 
-            self.circuit.downstream.write(self.choppingBuf.read(const.MTU))
+            self.downstream.write(self.choppingBuf.read(const.MTU))
 
         # Drain and send whatever is left in the output buffer.
         else:
@@ -284,12 +282,13 @@ class ScrambleSuitTransport( base.BaseTransport ):
             padBlurb = self.pktMorpher.getPadding(self.sendCrypter,
                                                   self.sendHMAC,
                                                   len(blurb))
-            self.circuit.downstream.write(blurb + padBlurb)
+            self.downstream.write(blurb + padBlurb)
             return
 
-        reactor.callLater(self.iatMorpher.randomSample(), self.flushPieces)
+        time.sleep(self.iatMorpher.randomSample())
+        self.flushPieces()
 
-    def processMessages( self, data ):
+    def processMessages(self, data):
         """
         Acts on extracted protocol messages based on header flags.
 
@@ -310,13 +309,12 @@ class ScrambleSuitTransport( base.BaseTransport ):
         for msg in msgs:
             # Forward data to the application.
             if msg.flags == const.FLAG_PAYLOAD:
-                self.circuit.upstream.write(msg.payload)
+                self.upstream.write(msg.payload)
 
             # Store newly received ticket.
             elif self.weAreClient and (msg.flags == const.FLAG_NEW_TICKET):
-                assert len(msg.payload) == (const.TICKET_LENGTH +
-                                            const.MASTER_KEY_LENGTH)
-                peer = self.circuit.downstream.transport.getPeer()
+                assert len(msg.payload) == (
+                    const.TICKET_LENGTH + const.MASTER_KEY_LENGTH)
 
             # Use the PRNG seed to generate the same probability distributions
             # as the server.  That's where the polymorphism comes from.
@@ -336,7 +334,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
                 #log.warning("Invalid message flags: %d." % msg.flags)
                 pass
 
-    def flushSendBuffer( self ):
+    def flushSendBuffer(self):
         """
         Flush the application's queued data.
 
@@ -356,7 +354,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
         self.sendRemote(self.sendBuf)
         self.sendBuf = ""
 
-    def receiveTicket( self, data ):
+    def receiveTicket(self, data):
         """
         Extract and verify a potential session ticket.
 
@@ -365,7 +363,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
         succeed, `True' is returned.  Otherwise, `False' is returned.
         """
 
-        if len(data) < (const.TICKET_LENGTH + const.MARK_LENGTH +
+        if len(data) < (const.TICKET_LENGTH + const.MARK_LENGTH + \
                         const.HMAC_SHA256_128_LENGTH):
             return False
 
@@ -376,7 +374,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
         if not self.decryptedTicket:
             newTicket = ticket.decrypt(potentialTicket[:const.TICKET_LENGTH],
                                        self.srvState)
-            if newTicket != None and newTicket.isValid():
+            if newTicket is not None and newTicket.isValid():
                 self.deriveSecrets(newTicket.masterKey)
                 self.decryptedTicket = True
             else:
@@ -391,9 +389,10 @@ class ScrambleSuitTransport( base.BaseTransport ):
             return False
 
         # Now, verify if the HMAC is valid.
-        existingHMAC = potentialTicket[index + const.MARK_LENGTH:
-                                       index + const.MARK_LENGTH +
-                                       const.HMAC_SHA256_128_LENGTH]
+        existingHMAC = potentialTicket[
+            index + const.MARK_LENGTH:index + const.MARK_LENGTH + \
+                const.HMAC_SHA256_128_LENGTH]
+
         authenticated = False
         for epoch in util.expandedEpoch():
             myHMAC = mycrypto.HMAC_SHA256_128(self.recvHMAC,
@@ -427,7 +426,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
 
         return True
 
-    def receivedUpstream( self, data ):
+    def receivedUpstream(self, data):
         """
         Sends data to the remote machine or queues it to be sent later.
 
@@ -445,7 +444,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
             #log.debug("Buffered %d bytes of outgoing data." %
             #          len(self.sendBuf))
 
-    def sendTicketAndSeed( self ):
+    def sendTicketAndSeed(self):
         """
         Send a session ticket and the PRNG seed to the client.
 
@@ -462,7 +461,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
                         flags=const.FLAG_PRNG_SEED)
         self.flushSendBuffer()
 
-    def receivedDownstream( self, data ):
+    def receivedDownstream(self, data):
         """
         Receives and processes data coming from the remote machine.
 
@@ -480,8 +479,8 @@ class ScrambleSuitTransport( base.BaseTransport ):
                 #log.info("Terminating connection after having received >= %d"
                 #         " bytes because client could not "
                 #         "authenticate." % self.srvState.closingThreshold)
-                self.circuit.close()
-                return
+
+                raise EOFError('Authentication still was not completed')
 
         elif self.weAreServer and (self.protoState == const.ST_WAIT_FOR_AUTH):
 
@@ -501,7 +500,7 @@ class ScrambleSuitTransport( base.BaseTransport ):
                 #log.debug("Sending %d bytes of UniformDH handshake and "
                 #          "session ticket." % len(handshakeMsg))
 
-                self.circuit.downstream.write(handshakeMsg)
+                self.downstream.write(handshakeMsg)
                 #log.debug("UniformDH authentication succeeded.")
 
                 #log.debug("Switching to state ST_CONNECTED.")
@@ -536,121 +535,17 @@ class ScrambleSuitTransport( base.BaseTransport ):
             self.flushSendBuffer()
 
         if self.protoState == const.ST_CONNECTED:
-
             self.processMessages(data.read())
 
-    @classmethod
-    def register_external_mode_cli( cls, subparser ):
-        """
-        Register a CLI arguments to pass a secret or ticket to ScrambleSuit.
-
-        Two options are made available over the command line interface: one to
-        specify a ticket file and one to specify a UniformDH shared secret.
-        """
-
-        passArgs = subparser.add_mutually_exclusive_group(required=True)
-
-        passArgs.add_argument("--password",
-                               type=str,
-                               help="Shared secret for UniformDH",
-                               dest="uniformDHSecret")
-
-        passArgs.add_argument("--password-file",
-                               type=str,
-                               help="File containing shared secret for UniformDH",
-                               action=ReadPassFile,
-                               dest="uniformDHSecret")
-
-        super(ScrambleSuitTransport, cls).register_external_mode_cli(subparser)
-
-    @classmethod
-    def validate_external_mode_cli( cls, args ):
-        """
-        Assign the given command line arguments to local variables.
-        """
-
-        uniformDHSecret = None
-
-        try:
-            uniformDHSecret = base64.b32decode(util.sanitiseBase32(
-                                     args.uniformDHSecret))
-        except (TypeError, AttributeError) as error:
-            log.error(error.message)
-            raise base.PluggableTransportError("Given password '%s' is not " \
-                    "valid Base32!  Run 'generate_password.py' to generate " \
-                    "a good password." % args.uniformDHSecret)
-
-        parentalApproval = super(
-            ScrambleSuitTransport, cls).validate_external_mode_cli(args)
-        if not parentalApproval:
-            # XXX not very descriptive nor helpful, but the parent class only
-            #     returns a boolean without telling us what's wrong.
-            raise base.PluggableTransportError(
-                "Pluggable Transport args invalid: %s" % args )
-
-        if uniformDHSecret:
-            rawLength = len(uniformDHSecret)
-            if rawLength != const.SHARED_SECRET_LENGTH:
-                raise base.PluggableTransportError(
-                    "The UniformDH password must be %d bytes in length, ",
-                    "but %d bytes are given."
-                    % (const.SHARED_SECRET_LENGTH, rawLength))
-            else:
-                cls.uniformDHSecret = uniformDHSecret
-
-    def handle_socks_args( self, args ):
-        """
-        Receive arguments `args' passed over a SOCKS connection.
-
-        The SOCKS authentication mechanism is (ab)used to pass arguments to
-        pluggable transports.  This method receives these arguments and parses
-        them.  As argument, we only expect a UniformDH shared secret.
-        """
-
-        #log.debug("Received the following arguments over SOCKS: %s." % args)
-
-        if len(args) != 1:
-            raise base.SOCKSArgsError("Too many SOCKS arguments "
-                                      "(expected 1 but got %d)." % len(args))
-
-        # The ScrambleSuit specification defines that the shared secret is
-        # called "password".
-        if not args[0].startswith("password="):
-            raise base.SOCKSArgsError("The SOCKS argument must start with "
-                                      "`password='.")
-
-        # A shared secret might already be set if obfsproxy is in external
-        # mode.
-        if self.uniformDHSecret:
-            log.warning("A UniformDH password was already specified over "
-                        "the command line.  Using the SOCKS secret instead.")
-
-        try:
-            self.uniformDHSecret = base64.b32decode(util.sanitiseBase32(
-                                          args[0].split('=')[1].strip()))
-        except TypeError as error:
-            log.error(error.message)
-            raise base.PluggableTransportError("Given password '%s' is not " \
-                    "valid Base32!  Run 'generate_password.py' to generate " \
-                    "a good password." % args[0].split('=')[1].strip())
-
-        rawLength = len(self.uniformDHSecret)
-        if rawLength != const.SHARED_SECRET_LENGTH:
-            raise base.PluggableTransportError("The UniformDH password "
-                    "must be %d bytes in length but %d bytes are given." %
-                    (const.SHARED_SECRET_LENGTH, rawLength))
-
-        self.uniformdh = uniformdh.new(self.uniformDHSecret, self.weAreServer)
-
-
-class ScrambleSuitClient( ScrambleSuitTransport ):
+class ScrambleSuitClient(ScrambleSuitTransport):
 
     """
     Extend the ScrambleSuit class.
     """
 
     password=None
-    def __init__( self, *args, **kwargs ):
+
+    def __init__(self, *args, **kwargs):
         """
         Initialise a ScrambleSuitClient object.
         """
@@ -671,13 +566,14 @@ class ScrambleSuitClient( ScrambleSuitTransport ):
         ScrambleSuitTransport.__init__(self, *args, **kwargs)
 
 
-class ScrambleSuitServer( ScrambleSuitTransport ):
+class ScrambleSuitServer(ScrambleSuitTransport):
 
     """
     Extend the ScrambleSuit class.
     """
     password=None
-    def __init__( self, *args, **kwargs ):
+
+    def __init__(self, *args, **kwargs):
         """
         Initialise a ScrambleSuitServer object.
         """

